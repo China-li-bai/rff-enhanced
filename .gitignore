@@ -7,3 +7,4 @@ __pycache__
 PLANS
 AGENT.md
 .windsurfrules
+llm_config.toml

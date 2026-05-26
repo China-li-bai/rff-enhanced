@@ -22,6 +22,7 @@ dependencies = [
     "ipykernel",
     "ipywidgets",
     "instructor",
+    "litellm",
     "matplotlib",
     "mechanicalsoup",
     "notebook",
@@ -54,6 +55,9 @@ dev = [
     "pytest", 
     "mypy"
 ]
+
+[project.optional-dependencies]
+all-providers = ["litellm"]
 
 [project.scripts]
 inference_from_dataset = "api.inference.inference_from_dataset:main"

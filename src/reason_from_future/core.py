@@ -264,7 +264,7 @@ def reason_from_future(
     max_iters: int = 16,   # 最大迭代次数：防止无限循环
     min_iters: int = 1,    # 最少迭代次数：防止过早接受"看起来不错"的错误答案
     require_gold: bool = True,  # 是否必须和标准答案匹配：True=严格模式，False=宽松模式
-    model: str = "gemini-2.5-flash-preview-05-20",  # [跨文件] 传给 llm_call() 的模型名
+    model: str | None = None,
     verbose: bool = False,  # 是否打印详细日志
 ) -> str:
     """RFF (Reason-from-Future) 主循环。
