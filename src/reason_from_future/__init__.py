@@ -28,7 +28,7 @@ from .core_nhx import (
 from .llm import llm_call
 
 # Example problem specifications
-from .specs import Game24Spec, GSM8KSpec, GSM8KNiHaixiaSpec
+from .specs import Game24Spec, GSM8KSpec, GSM8KNiHaixiaSpec, HumanEvalNiHaixiaSpec
 
 __all__ = [
     # from .core (原版)
@@ -49,4 +49,5 @@ __all__ = [
     "Game24Spec",
     "GSM8KSpec",
     "GSM8KNiHaixiaSpec",
+    "HumanEvalNiHaixiaSpec",
 ]

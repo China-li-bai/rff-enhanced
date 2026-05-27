@@ -1,0 +1,92 @@
+{
+  "meta": {
+    "model": "openai/deepseek-ai/DeepSeek-V4-Flash",
+    "mode": "compare",
+    "num_samples": 5,
+    "max_iters": 8
+  },
+  "baseline": [
+    {
+      "task_id": "HumanEval/6",
+      "passed": true,
+      "error": null,
+      "code": "from typing import List\n\n\ndef parse_nested_parens(paren_string: str) -> List[int]:\n    \"\"\" Input to this function is a string represented multiple groups for nested parentheses separated by spaces.\n    For each of the group, output the deepest level of nesting of parentheses.\n    E.g. (()()) has maximum two levels of nesting while ((())) has three.\n\n    >>> parse_nested_parens('(()()) ((())) () ((())()())')\n    [2, 3, 1, 3]\n    \"\"\"\nfrom typing import List\n\ndef parse_nested_parens(paren_string: str) -> List[int]:\n    groups = paren_string.split()\n    result = []\n    for group in groups:\n        depth = 0\n        max_depth = 0\n        for ch in group:\n            if ch == '(':\n                depth += 1\n                if depth > max_depth:\n                    max_depth = depth\n            elif ch == ')':\n                depth -= 1\n        result.append(max_depth)\n    return result",
+      "elapsed": 3.61,
+      "attempts": 1
+    },
+    {
+      "task_id": "HumanEval/28",
+      "passed": false,
+      "error": "    ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"<string>\", line 1, in <module>\nNameError: name 'List' is not defined. Did you mean: 'list'?",
+      "code": "def concatenate(strings: List[str]) -> str:\n    \"\"\" Concatenate list of strings into a single string\n    >>> concatenate([])\n    ''\n    >>> concatenate(['a', 'b', 'c'])\n    'abc'\n    \"\"\"\n    return ''.join(strings)",
+      "elapsed": 6.07,
+      "attempts": 1
+    },
+    {
+      "task_id": "HumanEval/62",
+      "passed": true,
+      "error": null,
+      "code": "def derivative(xs: list):\n    \"\"\" xs represent coefficients of a polynomial.\n    xs[0] + xs[1] * x + xs[2] * x^2 + ....\n     Return derivative of this polynomial in the same form.\n    >>> derivative([3, 1, 2, 4, 5])\n    [1, 4, 12, 20]\n    >>> derivative([1, 2, 3])\n    [2, 6]\n    \"\"\"\n    return [i * xs[i] for i in range(1, len(xs))]",
+      "elapsed": 4.0,
+      "attempts": 1
+    },
+    {
+      "task_id": "HumanEval/70",
+      "passed": true,
+      "error": null,
+      "code": "def strange_sort_list(lst):\n    # Edge case: empty list\n    if not lst:\n        return []\n\n    # Sort the list to easily access min and max\n    sorted_list = sorted(lst)\n    left = 0\n    right = len(sorted_list) - 1\n    result = []\n    take_left = True  # Start with the minimum (left)\n\n    while left <= right:\n        if take_left:\n            result.append(sorted_list[left])\n            left += 1\n        else:\n            result.append(sorted_list[right])\n            right -= 1\n        take_left = not take_left\n\n    return result",
+      "elapsed": 10.03,
+      "attempts": 1
+    },
+    {
+      "task_id": "HumanEval/163",
+      "passed": true,
+      "error": null,
+      "code": "def generate_integers(a, b):\n    \"\"\"\n    Given two positive integers a and b, return the even digits between a\n    and b, in ascending order.\n    \"\"\"\n    low = min(a, b)\n    high = max(a, b)\n    return [num for num in range(low, high + 1) if num % 2 == 0 and num < 10]",
+      "elapsed": 43.15,
+      "attempts": 1
+    }
+  ],
+  "nhx": [
+    {
+      "task_id": "HumanEval/6",
+      "passed": true,
+      "error": null,
+      "code": "from typing import List\n\ndef parse_nested_parens(paren_string: str) -> List[int]:\n    \"\"\" Input to this function is a string represented multiple groups for nested parentheses separated by spaces.\n    For each of the group, output the deepest level of nesting of parentheses.\n    E.g. (()()) has maximum two levels of nesting while ((())) has three.\n\n    >>> parse_nested_parens('(()()) ((())) () ((())()())')\n    [2, 3, 1, 3]\n    \"\"\"\n    groups = paren_string.split()\n    result = []\n    for group in groups:\n        max_depth = 0\n        current_depth = 0\n        for char in group:\n            if char == '(':\n                current_depth += 1\n                if current_depth > max_depth:\n                    max_depth = current_depth\n            elif char == ')':\n                current_depth -= 1\n        result.append(max_depth)\n    return result",
+      "elapsed": 33.0,
+      "attempts": 1
+    },
+    {
+      "task_id": "HumanEval/28",
+      "passed": true,
+      "error": null,
+      "code": "from typing import List\n\ndef concatenate(strings: List[str]) -> str:\n    \"\"\" Concatenate list of strings into a single string\n    >>> concatenate([])\n    ''\n    >>> concatenate(['a', 'b', 'c'])\n    'abc'\n    \"\"\"\n    return ''.join(strings)",
+      "elapsed": 2.25,
+      "attempts": 1
+    },
+    {
+      "task_id": "HumanEval/62",
+      "passed": true,
+      "error": null,
+      "code": "def derivative(xs: list):\n    \"\"\" xs represent coefficients of a polynomial.\n    xs[0] + xs[1] * x + xs[2] * x^2 + ....\n     Return derivative of this polynomial in the same form.\n    >>> derivative([3, 1, 2, 4, 5])\n    [1, 4, 12, 20]\n    >>> derivative([1, 2, 3])\n    [2, 6]\n    \"\"\"\n    # Derivative of constant term is 0, so we start from index 1\n    # Each term xs[i] * x^i becomes i * xs[i] * x^(i-1)\n    return [i * xs[i] for i in range(1, len(xs))]",
+      "elapsed": 5.11,
+      "attempts": 1
+    },
+    {
+      "task_id": "HumanEval/70",
+      "passed": true,
+      "error": null,
+      "code": "def strange_sort_list(lst):\n    '''\n    Given list of integers, return list in strange order.\n    Strange sorting, is when you start with the minimum value,\n    then maximum of the remaining integers, then minimum and so on.\n\n    Examples:\n    strange_sort_list([1, 2, 3, 4]) == [1, 4, 2, 3]\n    strange_sort_list([5, 5, 5, 5]) == [5, 5, 5, 5]\n    strange_sort_list([]) == []\n    '''\n    if not lst:\n        return []\n    sorted_lst = sorted(lst)\n    result = []\n    left = 0\n    right = len(sorted_lst) - 1\n    while left <= right:\n        result.append(sorted_lst[left])\n        left += 1\n        if left <= right:\n            result.append(sorted_lst[right])\n            right -= 1\n    return result",
+      "elapsed": 19.97,
+      "attempts": 1
+    },
+    {
+      "task_id": "HumanEval/163",
+      "passed": true,
+      "error": null,
+      "code": "def generate_integers(a, b):\n    \"\"\"\n    Given two positive integers a and b, return the even digits between a\n    and b, in ascending order.\n\n    For example:\n    generate_integers(2, 8) => [2, 4, 6, 8]\n    generate_integers(8, 2) => [2, 4, 6, 8]\n    generate_integers(10, 14) => []\n    \"\"\"\n    low = min(a, b)\n    high = max(a, b)\n    even_digits = [0, 2, 4, 6, 8]\n    return [d for d in even_digits if low <= d <= high]",
+      "elapsed": 344.3,
+      "attempts": 1
+    }
+  ]
+}
