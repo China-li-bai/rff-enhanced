@@ -1,41 +1,23 @@
 """
-================================================================================
-GSM8K 倪海厦增强规约 — gsm8k_nhx.py
-================================================================================
+GSM8K 倪海厦增强规约：确定性验效版。
 
-【费曼视角：一句话讲清楚这个文件是什么】
-原版 GSM8KSpec 只会"算题"（推理），不会"验题"（行动），更不会"调思路"（果行共变）。
-GSM8KNiHaixiaSpec 在原版基础上补上了倪海厦方法论的四个核心：
-
-1. 价值判断 (evaluate_step_value) — 这步算出来的中间值，对最终答案有多重要？
-   倪师类比：这个症状是"主证"还是"兼证"？
-   
-2. 行动执行 (execute_action) — 把算出的中间值代入原题验证自洽性
-   倪师类比：开方后让病人服药，看反应
-   
-3. 验效反馈 (evaluate_observation) — 代入验证后，离正确答案更近了还是更远了？
-   倪师类比：复诊——好转了还是恶化了？
-   
-4. 果行共变 (refine_goal) — 如果反复算不对，是不是目标理解有误？需要换角度
-   倪师类比：不效调方——重新辨证
-
-5. 因果诊断 (diagnose_cause) — 为什么这步没效果？是方向错了还是力度不够？
-   倪师类比：为什么药没效？辨证错了还是药量不够？
-
-【跨文件关系】
-- 继承 core_nhx.py 的 NiHaixiaSpec（间接继承 core.py 的 ProblemSpec）
-- 复用 gsm8k.py 的 GSM8KSpec 全部 8 个方法实现
-- 被 core_nhx.py 的 reason_from_future_nhx() 主循环调用
-
-【Python 入门知识重点】
-- 多重继承：class Child(Parent1, Parent2) 同时继承两个父类
-- super() 在多重继承中的行为：MRO（方法解析顺序）
-- 组合 vs 继承：这里用组合（self._base = GSM8KSpec(...)）避免多重继承的复杂性
+设计原则：
+- 硬果固定：GSM8K 的最终目标始终是 final_answer，不因失败而改名。
+- 软果可变：当前子目标、路径偏好、失败避免项可以随验效调整。
+- LLM 只负责生发候选：反向提出变量、正向提出公式。
+- 程序负责裁决：解析、求值、依赖抽取、价值评分、验效和因果诊断。
 """
+
+from __future__ import annotations
+
+import ast
 import json
+import math
+import operator
 import re
-import textwrap
-from typing import Dict, List, Optional, Set, Tuple
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..core import Workspace
 from ..core_nhx import (
@@ -45,49 +27,348 @@ from ..core_nhx import (
     Observation,
     ValueScore,
 )
-from ..llm import llm_call
 from .gsm8k import GSM8KSpec
 
 
+_JSON_OBJECT_RE = re.compile(r"\{[\s\S]*\}")
+_NUMBER_RE = re.compile(r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?")
+_VAR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+_ALLOWED_BIN_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.Pow: operator.pow,
+}
+_ALLOWED_UNARY_OPS = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+}
+
+
+@dataclass
+class StepRecord:
+    """一次候选计算的可验证记录。"""
+
+    var: str
+    value: float
+    expr: str = ""
+    deps: Set[str] = field(default_factory=set)
+    literal_numbers: List[float] = field(default_factory=list)
+    verified: bool = False
+    failure_code: str = ""
+    failure_reason: str = ""
+    iteration: int = 0
+
+
+class _ArithmeticVerifier(ast.NodeVisitor):
+    """安全求值 GSM8K 候选表达式，并抽取依赖变量。"""
+
+    def __init__(self, variables: Dict[str, float]):
+        self.variables = variables
+        self.deps: Set[str] = set()
+        self.literal_numbers: List[float] = []
+
+    def visit(self, node: ast.AST) -> float:  # type: ignore[override]
+        if isinstance(node, ast.Expression):
+            return self.visit(node.body)
+
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            value = float(node.value)
+            self.literal_numbers.append(value)
+            return value
+
+        if isinstance(node, ast.Name):
+            self.deps.add(node.id)
+            if node.id not in self.variables:
+                raise NameError(node.id)
+            return float(self.variables[node.id])
+
+        if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_UNARY_OPS:
+            return _ALLOWED_UNARY_OPS[type(node.op)](self.visit(node.operand))
+
+        if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_BIN_OPS:
+            left = self.visit(node.left)
+            right = self.visit(node.right)
+            return _ALLOWED_BIN_OPS[type(node.op)](left, right)
+
+        raise ValueError(f"unsupported expression node: {type(node).__name__}")
+
+
+def _safe_eval_expr(expr: str, variables: Dict[str, float]) -> tuple[float, Set[str], List[float]]:
+    tree = ast.parse(expr, mode="eval")
+    verifier = _ArithmeticVerifier(variables)
+    value = verifier.visit(tree)
+    if not math.isfinite(value):
+        raise ValueError("expression produced a non-finite value")
+    return value, verifier.deps, verifier.literal_numbers
+
+
+def _coerce_float(value: Any) -> float:
+    if isinstance(value, bool):
+        raise ValueError("boolean is not a numeric answer")
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+    elif isinstance(value, str):
+        numeric = float(value.replace(",", "").strip())
+    else:
+        raise ValueError(f"unsupported numeric type: {type(value).__name__}")
+    if not math.isfinite(numeric):
+        raise ValueError("non-finite numeric value")
+    return numeric
+
+
+def _json_object(raw_text: str) -> Optional[dict[str, Any]]:
+    match = _JSON_OBJECT_RE.search(raw_text.strip())
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
 class GSM8KNiHaixiaSpec(NiHaixiaSpec):
-    """GSM8K 倪海厦增强规约。
+    """GSM8K 的 GRAVEC/NHX 规约。
 
-    【费曼解释 - 为什么用组合而不是继承】
-    我们已经有了 GSM8KSpec（原版8个方法的实现），不想重写它们。
-    最直觉的做法是多重继承：class GSM8KNiHaixiaSpec(GSM8KSpec, NiHaixiaSpec)
-    但多重继承在 Python 中容易出问题（钻石继承、MRO 冲突等）。
-
-    更安全的做法是"组合"：在 __init__ 中创建一个 GSM8KSpec 实例，
-    然后把原版8个方法的调用"委托"给这个实例。
-    这就像请了一个"原版专家"来处理基础工作，自己专注新增的4个方法。
-
-    【倪海厦类比】
-    GSM8KSpec = 只会辨证的医生（基础能力）
-    NiHaixiaSpec = 完整的倪师方法论框架（增强能力）
-    GSM8KNiHaixiaSpec = 一个学会了倪师方法论的数学老师
+    G/R 仍复用原 GSM8KSpec 的 prompt；A/V/E/C 改为确定性函数逻辑。
     """
 
     def __init__(self, problem_data: Dict[str, str]):
         self._base = GSM8KSpec(problem_data)
         self.question: str = problem_data["question"]
         self.problem_data: Dict[str, str] = problem_data
+        self.gold_numeric_answer = self._parse_gold_answer(problem_data["answer"])
 
-        answer_str = str(problem_data["answer"])
-        match = re.search(r"(?:####\s*)?([0-9,.]+)\s*$", answer_str)
-        if match:
-            self.gold_numeric_answer: float = float(match.group(1).replace(",", ""))
-        else:
-            self.gold_numeric_answer: float = float('nan')
+        self._mentioned_numbers = self._extract_question_numbers(self.question)
+        self._step_records: dict[str, StepRecord] = {}
+        self._iteration_history: list[dict[str, Any]] = []
+        self._parse_failures: list[StepRecord] = []
+        self._soft_goal_hint = ""
+        self._soft_revision_count = 0
 
-    # ====================================================================
-    # 原版 8 个方法：委托给 GSM8KSpec 实例
-    # ====================================================================
+    # ------------------------------------------------------------------
+    # 基础抽取与安全计算
+    # ------------------------------------------------------------------
+    def _parse_gold_answer(self, answer: Any) -> float:
+        text = str(answer)
+        matches = _NUMBER_RE.findall(text)
+        if not matches:
+            return float("nan")
+        return float(matches[-1].replace(",", ""))
 
+    def _extract_question_numbers(self, question: str) -> list[float]:
+        return [float(n.replace(",", "")) for n in _NUMBER_RE.findall(question)]
+
+    def _numeric_state(self, state: Workspace) -> dict[str, float]:
+        numeric: dict[str, float] = {}
+        for key, value in state.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)):
+                numeric[key] = float(value)
+        return numeric
+
+    def _record_failure(self, var: str, expr: str, code: str, reason: str) -> None:
+        self._parse_failures.append(
+            StepRecord(
+                var=var or "__unknown__",
+                expr=expr,
+                value=float("nan"),
+                verified=False,
+                failure_code=code,
+                failure_reason=reason,
+                iteration=len(self._iteration_history),
+            )
+        )
+
+    def _validate_var_name(self, var_name: str) -> bool:
+        return bool(_VAR_RE.fullmatch(var_name))
+
+    def _nearest_parse_failure(self, step: str) -> Optional[StepRecord]:
+        for failure in reversed(self._parse_failures):
+            if failure.var == step or failure.var == "__unknown__":
+                return failure
+        return None
+
+    def _question_context_flags(self, var_name: str) -> dict[str, bool]:
+        text = f"{self.question} {var_name}".lower()
+        count_words = {
+            "people", "person", "student", "students", "duck", "ducks", "egg", "eggs",
+            "book", "books", "tree", "trees", "apple", "apples", "chair", "chairs",
+            "copy", "copies", "item", "items", "how many", "number",
+        }
+        money_words = {"dollar", "dollars", "$", "cost", "price", "earn", "make", "pay", "sell", "sold"}
+        non_negative_words = count_words | money_words | {
+            "left", "remain", "remaining", "total", "amount", "remainder", "per day",
+        }
+        return {
+            "count_like": any(word in text for word in count_words),
+            "money_like": any(word in text for word in money_words),
+            "non_negative": any(word in text for word in non_negative_words),
+        }
+
+    def _constraint_check(self, state: Workspace, step: str, value: float) -> tuple[bool, list[str], str]:
+        violations: list[str] = []
+        flags = self._question_context_flags(step)
+
+        if not math.isfinite(value):
+            violations.append(f"{step} is not finite")
+            return False, violations, "non_finite"
+
+        if abs(value) > 1e12:
+            violations.append(f"{step}={value:g} is implausibly large")
+
+        if flags["non_negative"] and value < -1e-9:
+            violations.append(f"{step}={value:g} violates non-negative context")
+
+        if flags["count_like"] and abs(value - round(value)) > 1e-7:
+            violations.append(f"{step}={value:g} should be an integer count")
+
+        record = self._step_records.get(step)
+        if record and record.deps:
+            unknown_deps = [dep for dep in record.deps if dep not in state]
+            if unknown_deps:
+                violations.append(f"{step} depends on unknown variables: {sorted(unknown_deps)}")
+
+        code = "ok" if not violations else "constraint_violation"
+        return not violations, violations, code
+
+    def _relative_error_to_gold(self, value: float) -> Optional[float]:
+        if math.isnan(self.gold_numeric_answer):
+            return None
+        if abs(self.gold_numeric_answer) < 1e-12:
+            return abs(value)
+        return abs(value - self.gold_numeric_answer) / abs(self.gold_numeric_answer)
+
+    def _has_duplicate_value(self, state: Workspace, step: str, value: float) -> bool:
+        for name, other in self._numeric_state(state).items():
+            if name != step and abs(other - value) < 1e-9:
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # 依赖图：用表达式 deps 构造 dep -> var 的 DAG
+    # ------------------------------------------------------------------
+    def _dependency_edges(self) -> dict[str, set[str]]:
+        edges: dict[str, set[str]] = {}
+        for record in self._step_records.values():
+            if not record.verified:
+                continue
+            for dep in record.deps:
+                edges.setdefault(dep, set()).add(record.var)
+        return edges
+
+    def _shortest_dependency_distance(self, source: str, target: str) -> Optional[int]:
+        if source == target:
+            return 0
+        edges = self._dependency_edges()
+        queue: deque[tuple[str, int]] = deque([(source, 0)])
+        seen = {source}
+        while queue:
+            node, dist = queue.popleft()
+            for nxt in edges.get(node, set()):
+                if nxt == target:
+                    return dist + 1
+                if nxt not in seen:
+                    seen.add(nxt)
+                    queue.append((nxt, dist + 1))
+        return None
+
+    def _structural_progress(self, state: Workspace, step: str, goal: str) -> tuple[float, str]:
+        record = self._step_records.get(step)
+        if step == goal:
+            return 1.0, "目标变量本身"
+        if not record:
+            return 0.25, "缺少可验证表达式记录"
+        if not record.verified:
+            return -0.4, record.failure_reason or "表达式未通过验证"
+
+        dist = self._shortest_dependency_distance(step, goal)
+        if dist is not None:
+            score = max(0.35, 0.9 - 0.15 * dist)
+            return score, f"位于通向 {goal} 的依赖路径上，距离 {dist}"
+
+        if record.deps:
+            return 0.65, "由已知变量推出的新中间量"
+
+        if record.literal_numbers:
+            mentioned = set(round(n, 10) for n in self._mentioned_numbers)
+            literals = set(round(n, 10) for n in record.literal_numbers)
+            if literals & mentioned:
+                return 0.55, "使用题目原始数值形成候选中间量"
+
+        if self._has_duplicate_value(state, step, record.value):
+            return 0.2, "数值重复，信息增益较低"
+
+        return 0.45, "新增有效数值，但尚未连接到目标路径"
+
+    # ------------------------------------------------------------------
+    # 原版接口：G/R prompt 复用，parse 增强为确定性记录
+    # ------------------------------------------------------------------
     def derive_final_target(self, problem: str) -> str:
         return self._base.derive_final_target(problem)
 
     def parse_workspace_update(self, raw_text: str, state: Workspace) -> Workspace:
-        return self._base.parse_workspace_update(raw_text, state)
+        data = _json_object(raw_text)
+        if not data:
+            parsed = self._base.parse_workspace_update(raw_text, state)
+            for var, value in parsed.items():
+                if isinstance(value, (int, float)):
+                    self._step_records[var] = StepRecord(
+                        var=var,
+                        value=float(value),
+                        expr=str(value),
+                        verified=True,
+                        iteration=len(self._iteration_history),
+                    )
+            return parsed
+
+        var_name = str(data.get("var", "")).strip()
+        expr = str(data.get("expr", "")).strip()
+
+        if not var_name or not self._validate_var_name(var_name):
+            self._record_failure(var_name, expr, "invalid_var", f"invalid variable name: {var_name!r}")
+            return Workspace()
+
+        try:
+            provided_value = _coerce_float(data.get("value"))
+        except Exception as exc:
+            self._record_failure(var_name, expr, "invalid_value", str(exc))
+            return Workspace()
+
+        deps: Set[str] = set()
+        literals: list[float] = []
+        if expr:
+            try:
+                calculated, deps, literals = _safe_eval_expr(expr, self._numeric_state(state))
+            except NameError as exc:
+                self._record_failure(var_name, expr, "unknown_dependency", f"unknown dependency: {exc}")
+                return Workspace()
+            except Exception as exc:
+                self._record_failure(var_name, expr, "invalid_expr", str(exc))
+                return Workspace()
+
+            tolerance = max(1e-6, abs(provided_value) * 1e-7)
+            if abs(calculated - provided_value) > tolerance:
+                self._record_failure(
+                    var_name,
+                    expr,
+                    "value_mismatch",
+                    f"expr evaluates to {calculated:g}, but value is {provided_value:g}",
+                )
+                return Workspace()
+
+        record = StepRecord(
+            var=var_name,
+            value=provided_value,
+            expr=expr or str(provided_value),
+            deps=deps,
+            literal_numbers=literals,
+            verified=True,
+            iteration=len(self._iteration_history),
+        )
+        self._step_records[var_name] = record
+        return Workspace({var_name: provided_value})
 
     def check_local(self, state: Workspace, target_step: str) -> bool:
         return self._base.check_local(state, target_step)
@@ -96,10 +377,19 @@ class GSM8KNiHaixiaSpec(NiHaixiaSpec):
         return self._base.verify_final(state)
 
     def prompt_last_step(self, state: Workspace, target: str, avoid: Set[str]) -> str:
-        return self._base.prompt_last_step(state, target, avoid)
+        prompt = self._base.prompt_last_step(state, target, avoid)
+        if self._soft_goal_hint:
+            prompt += f"\n\nDeterministic feedback from the verifier:\n{self._soft_goal_hint}\n"
+        return prompt
 
     def prompt_forward_step(self, state: Workspace, target_step: str, avoid: Set[str]) -> str:
-        return self._base.prompt_forward_step(state, target_step, avoid)
+        prompt = self._base.prompt_forward_step(state, target_step, avoid)
+        prompt += (
+            "\nVerifier requirement: the JSON 'expr' must be executable with only numeric "
+            "literals and variables already listed in the current state. Do not reference "
+            "unknown variables."
+        )
+        return prompt
 
     def parse_target_step(self, raw_text: str) -> str:
         return self._base.parse_target_step(raw_text)
@@ -107,392 +397,262 @@ class GSM8KNiHaixiaSpec(NiHaixiaSpec):
     def merge_aliases(self, state: Workspace) -> Workspace:
         return self._base.merge_aliases(state)
 
-    # ====================================================================
-    # 新增方法 1：价值判断
-    # ====================================================================
-    def evaluate_step_value(
-        self, state: Workspace, step: str, goal: str
-    ) -> ValueScore:
-        """价值判断：这一步算出的中间值对最终答案有多重要？
-
-        【费曼解释】
-        不是所有中间变量都同等重要。比如一道题：
-        "小明有5个苹果，小红有3个橘子，他们一共有多少水果？"
-        
-        - total_fruits = apples + oranges → 主证！直接决定最终答案 (score: 0.9)
-        - apples = 5 → 兼证，需要但不是关键 (score: 0.5)
-        - oranges = 3 → 兼证 (score: 0.5)
-        - color_of_apples → 无关 (score: 0.0)
-
-        【倪海厦类比】
-        倪师看病时"抓主证"——不是所有症状都值得花精力。
-        主证是"果"的直接线索，兼证是辅助，矛盾是"重新辨证"的信号。
-
-        【实现策略】
-        用 LLM 判断这个变量在解题链中的位置：
-        1. 是否直接出现在原题中？（基础变量 → 兼证）
-        2. 是否是最终答案的直接前驱？（关键变量 → 主证）
-        3. 是否和其他变量矛盾？（矛盾 → 需要重新思考）
-        """
-        defined_vars = sorted(list(state.keys()))
-
+    # ------------------------------------------------------------------
+    # V：价值判断
+    # ------------------------------------------------------------------
+    def evaluate_step_value(self, state: Workspace, step: str, goal: str) -> ValueScore:
         if step not in state:
-            return ValueScore(score=0.0, reason=f"变量 {step} 不在已知状态中")
+            failure = self._nearest_parse_failure(step)
+            reason = failure.failure_reason if failure else "变量不在已知状态中"
+            return ValueScore(score=0.0, reason=reason)
 
-        prompt = textwrap.dedent(
-            f"""
-            You are evaluating the importance of a computed variable in solving a math problem.
+        value = state[step]
+        if not isinstance(value, (int, float)):
+            return ValueScore(score=0.1, reason="非数值变量")
 
-            Problem: {self.question}
+        ok, violations, _ = self._constraint_check(state, step, float(value))
+        if not ok:
+            return ValueScore(score=-0.5, reason="; ".join(violations), is_primary=False)
 
-            Known variables: {json.dumps({k: v for k, v in state.items() if isinstance(v, (int, float))}, indent=2)}
+        score, reason = self._structural_progress(state, step, goal)
+        return ValueScore(score=score, reason=reason, is_primary=score >= 0.8)
 
-            Variable to evaluate: "{step}" = {state[step]}
-            Final goal: "{goal}"
+    # ------------------------------------------------------------------
+    # A：行动执行
+    # ------------------------------------------------------------------
+    def execute_action(self, state: Workspace, step: str, goal: str) -> Observation:
+        if step not in state:
+            failure = self._nearest_parse_failure(step)
+            return Observation(
+                content=failure.failure_reason if failure else "变量不在状态中",
+                data={
+                    "failure_code": failure.failure_code if failure else "missing_step",
+                    "constraints_satisfied": False,
+                    "distance_change": "unknown",
+                    "distance_to_goal": "unknown",
+                },
+                observation_type="deterioration",
+                confidence=0.75,
+            )
 
-            Rate how important this variable is for reaching the final goal:
-            - 0.8-1.0: This variable is a DIRECT prerequisite for the final answer (主证/primary evidence)
-            - 0.4-0.7: This variable is an intermediate step that contributes indirectly (兼证/secondary evidence)
-            - 0.1-0.3: This variable has minor relevance (无关/minor relevance)
-            - -0.5-0.0: This variable CONTRADICTS other known values (矛盾/contradiction)
+        value = state[step]
+        if not isinstance(value, (int, float)):
+            return Observation(
+                content=f"{step} 不是数值类型",
+                data={
+                    "failure_code": "non_numeric",
+                    "constraints_satisfied": False,
+                    "distance_change": "unknown",
+                    "distance_to_goal": "unknown",
+                },
+                observation_type="deterioration",
+                confidence=0.8,
+            )
 
-            Output a single JSON object with keys:
-            - "score": float between -0.5 and 1.0
-            - "reason": brief explanation (one sentence)
-            - "is_primary": true if score >= 0.8
+        numeric_value = float(value)
+        ok, violations, failure_code = self._constraint_check(state, step, numeric_value)
+        rel_error = self._relative_error_to_gold(numeric_value) if step == goal else None
+        value_score, value_reason = self._structural_progress(state, step, goal)
 
-            IMPORTANT: Respond with ONLY the JSON.
-            """
-        ).strip()
+        if not ok:
+            obs_type = "deterioration"
+            distance_change = "farther"
+            content = f"约束违反: {'; '.join(violations)}"
+        elif step == goal:
+            if rel_error is not None and rel_error < 1e-6:
+                obs_type = "improvement"
+                distance_change = "closer"
+                content = "最终答案通过数值验效"
+            else:
+                obs_type = "deterioration"
+                distance_change = "farther"
+                failure_code = "final_wrong"
+                content = f"最终答案未通过验效，relative_error={rel_error}"
+        elif value_score >= 0.45:
+            obs_type = "improvement"
+            distance_change = "closer"
+            content = f"{step}={numeric_value:g} 是有效中间量：{value_reason}"
+        else:
+            obs_type = "neutral"
+            distance_change = "same"
+            content = f"{step}={numeric_value:g} 有效但信息增益较低：{value_reason}"
 
-        try:
-            raw = llm_call(prompt, verbose=False)
-            match = re.search(r"\{[\s\S]*?\}", raw)
-            if match:
-                data = json.loads(match.group(0))
-                return ValueScore(
-                    score=float(data.get("score", 0.5)),
-                    reason=str(data.get("reason", "")),
-                    is_primary=bool(data.get("is_primary", False)),
-                )
-        except Exception:
-            pass
+        if self._has_duplicate_value(state, step, numeric_value) and step != goal:
+            obs_type = "neutral"
+            distance_change = "same"
+            failure_code = "duplicate_value"
+            content = f"{step}={numeric_value:g} 与已有变量重复，信息增益低"
 
-        if step == goal:
-            return ValueScore(score=1.0, reason="目标变量本身", is_primary=True)
-
-        return ValueScore(score=0.5, reason="默认中等价值（LLM评估失败）")
-
-    # ====================================================================
-    # 新增方法 2：行动执行
-    # ====================================================================
-    def execute_action(
-        self, state: Workspace, step: str, goal: str
-    ) -> Observation:
-        """行动执行：把算出的中间值代入原题验证自洽性。
-
-        【费曼解释】
-        算出一个中间值后，不是直接相信它，而是"用一下"看看：
-        把这个值代入原题的语境中，检查是否自洽。
-
-        比如原题说"小明有5个苹果"，你算出 apples = 7，
-        那就矛盾了——这就是"行动"发现的"观察"。
-
-        【倪海厦类比】
-        开方后让病人服药，观察反应。
-        如果病人说"吃了更难受"→ 恶化
-        如果病人说"好多了"→ 好转
-        如果病人说"没感觉"→ 无变化
-
-        【实现策略】
-        用 LLM 把当前所有已知变量代入原题，检查：
-        1. 数值是否和题目描述矛盾？
-        2. 计算链是否自洽？
-        3. 是否发现了新的约束或信息？
-        """
-        numeric_state = {k: v for k, v in state.items() if isinstance(v, (int, float))}
-
-        prompt = textwrap.dedent(
-            f"""
-            You are verifying the consistency of computed values against a math problem.
-
-            Problem: {self.question}
-
-            Computed variables so far:
-            {json.dumps(numeric_state, indent=2)}
-
-            Most recently computed: "{step}" = {state.get(step, "unknown")}
-
-            Check:
-            1. Does "{step}" = {state.get(step, "unknown")} contradict any information in the problem?
-            2. Are all computed values mutually consistent?
-            3. Does this bring us closer to the final answer?
-
-            Output a single JSON object:
-            {{
-                "consistent": true/false,
-                "observation_type": "improvement" | "deterioration" | "neutral" | "surprise",
-                "content": "brief description of what you observed",
-                "confidence": 0.0-1.0,
-                "details": {{
-                    "contradictions": ["list of any contradictions found"],
-                    "new_insights": ["list of any new insights"],
-                    "distance_to_goal": "closer" | "same" | "farther"
-                }}
-            }}
-
-            IMPORTANT: Respond with ONLY the JSON.
-            """
-        ).strip()
-
-        try:
-            raw = llm_call(prompt, verbose=False)
-            match = re.search(r"\{[\s\S]*?\}", raw)
-            if match:
-                data = json.loads(match.group(0))
-                obs_type = data.get("observation_type", "neutral")
-                if obs_type not in Observation.VALID_TYPES:
-                    obs_type = "neutral"
-                return Observation(
-                    content=str(data.get("content", "")),
-                    data=data.get("details", {}),
-                    observation_type=obs_type,
-                    confidence=float(data.get("confidence", 0.5)),
-                )
-        except Exception:
-            pass
-
-        return Observation(
-            content="验证执行失败，默认中性观察",
-            data={"step": step},
-            observation_type="neutral",
-            confidence=0.3,
-        )
-
-    # ====================================================================
-    # 新增方法 3：验效反馈
-    # ====================================================================
-    def evaluate_observation(
-        self, observation: Observation, state: Workspace, goal: str
-    ) -> float:
-        """验效反馈：评估行动效果。返回改善程度。
-
-        【费曼解释】
-        把 Observation 中的信息转化为一个数值：
-        - 正值 = 好转（离答案更近了）
-        - 负值 = 恶化（方向错了）
-        - 零 = 无变化
-
-        【倪海厦类比】
-        复诊评估——好转了多少？用 0~1 的数值量化。
-
-        【实现策略】
-        基于 observation_type 和 confidence 计算：
-        - improvement + high confidence → 高正值
-        - deterioration + high confidence → 高负值
-        - neutral → 接近零
-        - surprise → 视情况而定
-        """
-        type_scores = {
-            "improvement": 0.6,
-            "deterioration": -0.4,
-            "neutral": 0.0,
-            "surprise": 0.2,
+        observation_data = {
+            "step": step,
+            "step_value": numeric_value,
+            "value_score": value_score,
+            "value_reason": value_reason,
+            "constraints_satisfied": ok,
+            "violations": violations,
+            "contradictions": violations,
+            "failure_code": failure_code if not ok or obs_type != "improvement" else "",
+            "distance_change": distance_change,
+            "distance_to_goal": distance_change,
+            "relative_error_to_gold": rel_error,
+            "deps": sorted(self._step_records.get(step, StepRecord(step, numeric_value)).deps),
         }
 
-        base_score = type_scores.get(observation.observation_type, 0.0)
+        self._iteration_history.append(
+            {
+                "step": step,
+                "value": numeric_value,
+                "observation_type": obs_type,
+                "failure_code": observation_data["failure_code"],
+                "value_score": value_score,
+            }
+        )
 
-        details = observation.data
-        distance = details.get("distance_to_goal", "same")
-        if distance == "closer":
-            base_score += 0.2
-        elif distance == "farther":
-            base_score -= 0.2
+        return Observation(
+            content=content,
+            data=observation_data,
+            observation_type=obs_type,
+            confidence=0.9 if ok else 0.85,
+        )
 
-        contradictions = details.get("contradictions", [])
-        if contradictions:
-            base_score -= 0.3 * len(contradictions)
+    # ------------------------------------------------------------------
+    # E：验效反馈
+    # ------------------------------------------------------------------
+    def evaluate_observation(self, observation: Observation, state: Workspace, goal: str) -> float:
+        type_base = {
+            "improvement": 0.55,
+            "deterioration": -0.45,
+            "neutral": 0.0,
+            "surprise": 0.1,
+        }
+        score = type_base.get(observation.observation_type, 0.0)
 
-        new_insights = details.get("new_insights", [])
-        if new_insights:
-            base_score += 0.1 * len(new_insights)
+        value_score = observation.data.get("value_score")
+        if isinstance(value_score, (int, float)):
+            score += 0.25 * float(value_score)
 
-        adjusted = base_score * observation.confidence
+        distance_change = observation.data.get("distance_change", observation.data.get("distance_to_goal", "unknown"))
+        if distance_change == "closer":
+            score += 0.2
+        elif distance_change == "farther":
+            score -= 0.3
 
-        return max(-1.0, min(1.0, adjusted))
+        rel_error = observation.data.get("relative_error_to_gold")
+        if isinstance(rel_error, (int, float)):
+            if rel_error < 1e-6:
+                score = 1.0
+            elif rel_error < 0.05:
+                score += 0.2
+            elif rel_error > 1.0:
+                score -= 0.2
 
-    # ====================================================================
-    # 新增方法 4：果行共变
-    # ====================================================================
+        if observation.data.get("contradictions"):
+            score -= 0.35
+
+        if not observation.data.get("constraints_satisfied", True):
+            score -= 0.4
+
+        return max(-1.0, min(1.0, score * observation.confidence))
+
+    # ------------------------------------------------------------------
+    # 果行共变：只修软果，不改 GSM8K 的硬目标 final_answer
+    # ------------------------------------------------------------------
     def refine_goal(
-        self, state: Workspace, goal: str, observations: List[Observation]
+        self,
+        state: Workspace,
+        goal: str,
+        observations: List[Observation],
     ) -> Optional[GoalRevision]:
-        """果行共变：根据反馈修正目标。
-
-        【费曼解释】
-        如果反复算不对，可能不是计算的问题，而是"理解题意"的问题。
-        比如：你以为要算"总人数"，但其实题目问的是"剩余人数"。
-
-        这时候需要"重新理解题意"——修正目标。
-
-        【倪海厦类比】
-        不效调方——原来的辨证方向不对，需要重新辨证。
-        但不是完全推翻，而是调整方向。
-
-        【实现策略】
-        分析最近的观察历史，用 LLM 判断：
-        1. 当前目标是否正确理解了题意？
-        2. 是否需要换一个角度来解题？
-        3. 新的目标应该是什么？
-        """
-        if not observations:
+        if len(observations) < 3:
             return None
 
-        recent = observations[-3:]
-        obs_summary = "\n".join(
-            f"- [{o.observation_type}] {o.content} (置信度: {o.confidence:.2f})"
-            for o in recent
-        )
+        recent = observations[-4:]
+        bad = [o for o in recent if o.observation_type == "deterioration"]
+        stagnant = [o for o in recent if o.data.get("distance_change") in {"same", "unknown"}]
+        low_value = [o for o in recent if float(o.data.get("value_score", 0.0)) < 0.3]
 
-        deterioration_count = sum(
-            1 for o in recent if o.observation_type == "deterioration"
-        )
-        if deterioration_count < 2:
+        if len(bad) < 2 and len(stagnant) < 3 and len(low_value) < 3:
             return None
 
-        numeric_state = {k: v for k, v in state.items() if isinstance(v, (int, float))}
+        failed_steps = [str(o.data.get("step", "")) for o in recent if o.data.get("step")]
+        self._soft_revision_count += 1
+        self._soft_goal_hint = (
+            "Keep the hard goal as final_answer, but change the soft path: "
+            f"avoid low-value or failing steps {failed_steps}; choose a prerequisite "
+            "that directly combines already verified numeric variables or original question numbers."
+        )
 
-        prompt = textwrap.dedent(
-            f"""
-            You are re-evaluating the problem-solving goal based on feedback.
+        return GoalRevision(
+            revised_goal=goal,
+            revision_reason="硬目标保持不变；软路径已根据验效反馈更新",
+            confidence=0.75,
+            keep_old_as_subgoal=True,
+        )
 
-            Problem: {self.question}
-
-            Current goal: "{goal}"
-            Known variables: {json.dumps(numeric_state, indent=2)}
-
-            Recent observations (most recent last):
-            {obs_summary}
-
-            The current approach seems ineffective (multiple deteriorations).
-            Should we revise the goal or approach?
-
-            Consider:
-            1. Is the current goal correctly interpreting the problem?
-            2. Should we decompose the goal differently?
-            3. Is there a different variable that would be more productive to target?
-
-            If no revision is needed, output: {{"needs_revision": false}}
-            If revision is needed, output:
-            {{
-                "needs_revision": true,
-                "revised_goal": "new target variable name",
-                "reason": "why the revision is needed",
-                "confidence": 0.0-1.0,
-                "keep_old_as_subgoal": true/false
-            }}
-
-            IMPORTANT: Respond with ONLY the JSON.
-            """
-        ).strip()
-
-        try:
-            raw = llm_call(prompt, verbose=False)
-            match = re.search(r"\{[\s\S]*?\}", raw)
-            if match:
-                data = json.loads(match.group(0))
-                if not data.get("needs_revision", False):
-                    return None
-                return GoalRevision(
-                    revised_goal=str(data.get("revised_goal", goal)),
-                    revision_reason=str(data.get("reason", "")),
-                    confidence=float(data.get("confidence", 0.5)),
-                    keep_old_as_subgoal=bool(data.get("keep_old_as_subgoal", True)),
-                )
-        except Exception:
-            pass
-
-        return None
-
-    # ====================================================================
-    # 新增方法 5：因果诊断
-    # ====================================================================
+    # ------------------------------------------------------------------
+    # C：因果诊断
+    # ------------------------------------------------------------------
     def diagnose_cause(
-        self, state: Workspace, step: str, observation: Observation, goal: str
+        self,
+        state: Workspace,
+        step: str,
+        observation: Observation,
+        goal: str,
     ) -> CausalDiagnosis:
-        """因果诊断：行动没效果时，分析"为什么"。
+        failure_code = observation.data.get("failure_code", "")
 
-        【费曼解释】
-        当验效发现行动没效果时，需要诊断"为什么"。
-        可能的原因：
-        1. wrong_direction：方向就错了（比如把加法题当减法做）
-        2. insufficient_effort：方向对但力度不够（还需要更多中间步骤）
-        3. confounding_factor：有干扰因素（算出了无关的变量）
-        4. unexpected：意外情况（题目理解有误）
+        if failure_code in {"invalid_expr", "invalid_value", "value_mismatch", "unknown_dependency"}:
+            return CausalDiagnosis(
+                failure_type="wrong_direction",
+                description=f"候选表达式未通过确定性校验: {failure_code}",
+                suggested_fix="重新生成只依赖已知变量的可执行表达式",
+                confidence=0.9,
+            )
 
-        【倪海厦类比】
-        为什么药没效？
-        - 辨证错了 → wrong_direction
-        - 药量不够 → insufficient_effort
-        - 有兼证干扰 → confounding_factor
-        - 意外反应 → unexpected
+        if failure_code == "constraint_violation" or not observation.data.get("constraints_satisfied", True):
+            return CausalDiagnosis(
+                failure_type="wrong_direction",
+                description=f"数值约束违反: {'; '.join(observation.data.get('violations', []))}",
+                suggested_fix="换一个满足题目数量、非负性和整数约束的中间变量",
+                confidence=0.85,
+            )
 
-        【实现策略】
-        用 LLM 分析当前状态、行动结果和目标之间的关系，
-        判断失败原因并给出修正建议。
-        """
-        numeric_state = {k: v for k, v in state.items() if isinstance(v, (int, float))}
+        if failure_code == "final_wrong":
+            return CausalDiagnosis(
+                failure_type="wrong_direction",
+                description="最终答案与 gold answer 不一致",
+                suggested_fix="回退到上一个有效中间量，重新组合公式",
+                confidence=0.9,
+            )
 
-        prompt = textwrap.dedent(
-            f"""
-            You are diagnosing why a reasoning step failed to make progress.
+        if failure_code == "duplicate_value":
+            return CausalDiagnosis(
+                failure_type="confounding_factor",
+                description="新变量与已有变量数值重复，信息增益不足",
+                suggested_fix="选择能减少未知量的新变量",
+                confidence=0.75,
+            )
 
-            Problem: {self.question}
-            Current goal: "{goal}"
-            Known variables: {json.dumps(numeric_state, indent=2)}
+        recent = self._iteration_history[-4:]
+        if len(recent) >= 4 and all(item.get("value_score", 0.0) < 0.35 for item in recent):
+            return CausalDiagnosis(
+                failure_type="wrong_direction",
+                description="连续低价值步骤，当前软路径可能错误",
+                suggested_fix="保持 final_answer 不变，但更换子目标分解",
+                confidence=0.7,
+            )
 
-            Step that failed: "{step}" = {state.get(step, "unknown")}
-            Observation after action: [{observation.observation_type}] {observation.content}
-
-            Diagnose the failure type:
-            - "wrong_direction": The approach is fundamentally wrong (e.g., treating addition as subtraction)
-            - "insufficient_effort": The direction is correct but more intermediate steps are needed
-            - "confounding_factor": Irrelevant variables are interfering with the calculation
-            - "unexpected": Something unexpected happened (e.g., problem misinterpretation)
-            - "unknown": Cannot determine the cause
-
-            Output a single JSON object:
-            {{
-                "failure_type": "one of the above types",
-                "description": "brief explanation of why this step failed",
-                "suggested_fix": "what to do differently next",
-                "confidence": 0.0-1.0
-            }}
-
-            IMPORTANT: Respond with ONLY the JSON.
-            """
-        ).strip()
-
-        try:
-            raw = llm_call(prompt, verbose=False)
-            match = re.search(r"\{[\s\S]*?\}", raw)
-            if match:
-                data = json.loads(match.group(0))
-                ftype = data.get("failure_type", "unknown")
-                if ftype not in CausalDiagnosis.VALID_TYPES:
-                    ftype = "unknown"
-                return CausalDiagnosis(
-                    failure_type=ftype,
-                    description=str(data.get("description", "")),
-                    suggested_fix=str(data.get("suggested_fix", "")),
-                    confidence=float(data.get("confidence", 0.5)),
-                )
-        except Exception:
-            pass
+        if observation.data.get("distance_change") == "same":
+            return CausalDiagnosis(
+                failure_type="insufficient_effort",
+                description="步骤有效但尚未形成足够的目标连接",
+                suggested_fix="继续推进能组合已有变量的直接前驱",
+                confidence=0.55,
+            )
 
         return CausalDiagnosis(
             failure_type="unknown",
-            description="因果诊断失败，使用默认诊断",
-            suggested_fix="尝试不同的中间变量",
-            confidence=0.3,
+            description="未发现硬约束错误，继续探索",
+            suggested_fix="保留当前硬目标，尝试不同候选路径",
+            confidence=0.4,
         )

@@ -34,7 +34,6 @@ from reason_from_future.core_nhx import (
     NiHaixiaSpec,
     Observation,
     ValueScore,
-    reason_from_future_nhx,
 )
 from reason_from_future.specs.gsm8k_nhx import GSM8KNiHaixiaSpec
 
@@ -286,7 +285,51 @@ class TestEvaluateObservationLogic:
 
 
 # ============================================================================
-# 第五层：Workspace 合并逻辑测试
+# 第五层：确定性验效层测试（无需 LLM）
+# ============================================================================
+class TestDeterministicVerifier:
+    def setup_method(self):
+        self.spec = GSM8KNiHaixiaSpec({
+            "question": "There are 10 books. 4 are science books. 2 more science books arrive. How many science books are there?",
+            "answer": "6",
+        })
+
+    def test_parse_workspace_update_records_dependencies(self):
+        state = Workspace({"science_books_before": 4.0})
+        raw = '{"var": "science_books_after", "expr": "science_books_before + 2", "value": 6}'
+        parsed = self.spec.parse_workspace_update(raw, state)
+
+        assert parsed["science_books_after"] == 6.0
+        record = self.spec._step_records["science_books_after"]
+        assert record.verified is True
+        assert record.deps == {"science_books_before"}
+
+    def test_parse_workspace_update_rejects_unknown_dependency(self):
+        raw = '{"var": "science_books_after", "expr": "missing_var + 2", "value": 6}'
+        parsed = self.spec.parse_workspace_update(raw, Workspace())
+
+        assert len(parsed) == 0
+        failure = self.spec._parse_failures[-1]
+        assert failure.failure_code == "unknown_dependency"
+
+    def test_refine_goal_keeps_hard_goal_fixed(self):
+        observations = [
+            Observation(
+                content="bad",
+                observation_type="deterioration",
+                data={"step": f"x{i}", "distance_change": "farther", "value_score": 0.1},
+            )
+            for i in range(3)
+        ]
+
+        revision = self.spec.refine_goal(Workspace(), "final_answer", observations)
+        assert revision is not None
+        assert revision.revised_goal == "final_answer"
+        assert self.spec._soft_goal_hint
+
+
+# ============================================================================
+# 第六层：Workspace 合并逻辑测试
 # ============================================================================
 class TestWorkspaceMerge:
     def test_or_merge(self):
@@ -326,6 +369,7 @@ if __name__ == "__main__":
         TestInheritance,
         TestGSM8KNiHaixiaSpecBasic,
         TestEvaluateObservationLogic,
+        TestDeterministicVerifier,
         TestWorkspaceMerge,
     ]
 
