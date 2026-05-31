@@ -16,11 +16,12 @@ from .core import ProblemSpec, Workspace, LocalCheckFail, reason_from_future
 
 # 倪海厦增强核心
 from .core_nhx import (
+    CausalDiagnosis,
+    GoalRevision,
     NiHaixiaSpec,
     Observation,
+    ReasoningPolicy,
     ValueScore,
-    GoalRevision,
-    CausalDiagnosis,
     reason_from_future_nhx,
 )
 
@@ -39,6 +40,7 @@ __all__ = [
     # from .core_nhx (倪海厦增强)
     "NiHaixiaSpec",
     "Observation",
+    "ReasoningPolicy",
     "ValueScore",
     "GoalRevision",
     "CausalDiagnosis",

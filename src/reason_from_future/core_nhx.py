@@ -50,7 +50,7 @@ from __future__ import annotations
 
 from abc import abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Set, Tuple
+from typing import Any, List, Optional, Set
 
 from .core import ProblemSpec, Workspace
 from .llm import llm_call
@@ -192,6 +192,20 @@ class CausalDiagnosis:
         self.confidence = max(0.0, min(1.0, self.confidence))
 
 
+@dataclass(frozen=True)
+class ReasoningPolicy:
+    """Candidate-generation policy borrowed from established reasoning styles.
+
+    GRAVEC remains the controller: it decides when to use a compact draft,
+    branch search, algorithmic planning, or final short answer. The policy is
+    intentionally advisory so domain specs keep deterministic verification.
+    """
+
+    name: str
+    borrowed_styles: tuple[str, ...]
+    instruction: str
+
+
 # ============================================================================
 # 第二部分：NiHaixiaSpec — 倪海厦增强规约
 # ============================================================================
@@ -323,6 +337,70 @@ class NiHaixiaSpec(ProblemSpec):
         E（验效）发现效果差 → 触发因果诊断 → 结果反馈给 C（校验）
         """
 
+    def select_reasoning_policy(
+        self,
+        state: Workspace,
+        goal: str,
+        iteration: int,
+        observations: List[Observation],
+        avoid: Set[str],
+    ) -> ReasoningPolicy:
+        """Choose how the next LLM candidate should be generated.
+
+        This is where GRAVEC borrows useful parts of CoT/AoT/ToT/CoD/SoT
+        without giving up deterministic value judgment, effect checking, and
+        causal diagnosis.
+        """
+        if self.check_local(state, goal):
+            return ReasoningPolicy(
+                name="sot_finalize",
+                borrowed_styles=("SoT",),
+                instruction="Keep only the final verified answer. Do not expand the reasoning.",
+            )
+
+        if observations:
+            recent = observations[-3:]
+            bad_count = sum(1 for obs in recent if obs.observation_type == "deterioration")
+            stagnant_count = sum(
+                1 for obs in recent if obs.observation_type in {"neutral", "surprise"}
+            )
+            if bad_count >= 1 and iteration >= 1:
+                return ReasoningPolicy(
+                    name="tot_branch_repair",
+                    borrowed_styles=("ToT", "CoD"),
+                    instruction=(
+                        "Consider multiple candidate fixes internally, reject branches that repeat known failures, "
+                        "then output only the single best next step or workspace update."
+                    ),
+                )
+            if stagnant_count >= 2 or avoid:
+                return ReasoningPolicy(
+                    name="cod_compact_retry",
+                    borrowed_styles=("CoD", "SoT"),
+                    instruction=(
+                        "Use a compact draft-refine pass: preserve only the decisive variables, avoid repeated "
+                        "low-value steps, and output the required structured result."
+                    ),
+                )
+
+        if iteration == 0:
+            return ReasoningPolicy(
+                name="cot_aot_initial_plan",
+                borrowed_styles=("CoT", "AoT"),
+                instruction=(
+                    "Use stepwise reasoning with an algorithmic plan: define the necessary subgoal, compute it, "
+                    "and make the result easy for the verifier to check."
+                ),
+            )
+
+        return ReasoningPolicy(
+            name="aot_forward_progress",
+            borrowed_styles=("AoT", "CoT"),
+            instruction=(
+                "Continue with the most direct algorithmic step toward the hard goal and output one structured result."
+            ),
+        )
+
 
 # ============================================================================
 # 第三部分：主循环 — 倪海厦版「以果决其行」六步曲
@@ -412,6 +490,16 @@ def reason_from_future_nhx(
         if attempt_counts[symbol] >= max_fails_per_var:
             avoid.add(symbol)
 
+    def attach_policy(prompt: str, policy: ReasoningPolicy) -> str:
+        return (
+            f"{prompt}\n\n"
+            "GRAVEC candidate-generation policy:\n"
+            f"- policy: {policy.name}\n"
+            f"- borrowed_styles: {', '.join(policy.borrowed_styles)}\n"
+            f"- instruction: {policy.instruction}\n"
+            "Return exactly the format requested by the domain spec."
+        )
+
     # ====================================================================
     # 主迭代循环：G → R → A → V → E → C
     # ====================================================================
@@ -423,6 +511,14 @@ def reason_from_future_nhx(
             print(f"迭代 {iter_idx + 1}/{max_iters} | 目标: {goal}")
             print(f"已知变量: {list(state.keys())}")
             print(f"{'='*60}")
+
+        policy = spec.select_reasoning_policy(state, goal, iter_idx, observation_history, avoid)
+
+        if verbose:
+            print(
+                f"[策略] {policy.name} "
+                f"(borrowed={','.join(policy.borrowed_styles)})"
+            )
 
         # ================================================================
         # C 前置检查：目标是否已在草稿纸上？
@@ -439,7 +535,7 @@ def reason_from_future_nhx(
         # G (Goal/以果)：反向推理 — 从目标往回看
         # ================================================================
         if goal not in avoid:
-            direct_prompt = spec.prompt_forward_step(state, goal, avoid)
+            direct_prompt = attach_policy(spec.prompt_forward_step(state, goal, avoid), policy)
             direct_raw = llm_call(direct_prompt, model=model, verbose=verbose)
             direct_state = state | spec.parse_workspace_update(direct_raw, state)
 
@@ -461,7 +557,7 @@ def reason_from_future_nhx(
         # ================================================================
         # G (Goal/以果)：反向推理 — 确定先决条件
         # ================================================================
-        g_prompt = spec.prompt_last_step(state, goal, avoid)
+        g_prompt = attach_policy(spec.prompt_last_step(state, goal, avoid), policy)
         raw_target_step_response = llm_call(g_prompt, model=model, verbose=verbose)
         target_step = spec.parse_target_step(raw_target_step_response)
 
@@ -476,7 +572,7 @@ def reason_from_future_nhx(
         # ================================================================
         # R (Reason/推理)：正向计算
         # ================================================================
-        r_prompt = spec.prompt_forward_step(state, target_step, avoid)
+        r_prompt = attach_policy(spec.prompt_forward_step(state, target_step, avoid), policy)
         forward_raw = llm_call(r_prompt, model=model, verbose=verbose)
         parsed_update = spec.parse_workspace_update(forward_raw, state)
 
@@ -489,7 +585,7 @@ def reason_from_future_nhx(
         if not parsed_update or not llm_provided_var:
             register_fail(target_step)
             if verbose:
-                print(f"[R-推理] LLM 未返回有效结果, 跳过本轮")
+                print("[R-推理] LLM 未返回有效结果, 跳过本轮")
             continue
 
         if verbose:
@@ -509,11 +605,10 @@ def reason_from_future_nhx(
                         f"[V-验效] 目标验证失败: LLM={answer_from_llm}, "
                         f"标准={gold_val_for_debug}"
                     )
-                else:
-                    register_fail(goal)
-                    if target_step != goal:
-                        register_fail(target_step)
-                    continue
+                register_fail(goal)
+                if target_step != goal:
+                    register_fail(target_step)
+                continue
             else:
                 register_fail(goal)
                 if target_step != goal:
@@ -525,7 +620,6 @@ def reason_from_future_nhx(
             temp_state = state | parsed_update
             if spec.check_local(temp_state, target_step):
                 state = temp_state
-                register_fail(target_step)
                 made_progress = True
             else:
                 register_fail(target_step)
@@ -572,7 +666,7 @@ def reason_from_future_nhx(
             if value_score.score < 0.0:
                 register_fail(step_to_evaluate)
                 if verbose:
-                    print(f"[V-价值判断] ❌ 矛盾步骤, 加入黑名单")
+                    print("[V-价值判断] ❌ 矛盾步骤, 加入黑名单")
 
         # ================================================================
         # E (Effect/验效)：检验行动效果
