@@ -311,6 +311,11 @@ class GSM8KNiHaixiaSpec(NiHaixiaSpec):
     def parse_workspace_update(self, raw_text: str, state: Workspace) -> Workspace:
         data = _json_object(raw_text)
         if not data:
+            boxed_matches = re.findall(r"\\boxed\{([^{}]+)\}", raw_text)
+            if boxed_matches:
+                numbers = _NUMBER_RE.findall(boxed_matches[-1])
+                if numbers:
+                    return Workspace({"final_answer": float(numbers[-1].replace(",", ""))})
             parsed = self._base.parse_workspace_update(raw_text, state)
             for var, value in parsed.items():
                 if isinstance(value, (int, float)):
@@ -383,6 +388,23 @@ class GSM8KNiHaixiaSpec(NiHaixiaSpec):
         return prompt
 
     def prompt_forward_step(self, state: Workspace, target_step: str, avoid: Set[str]) -> str:
+        if target_step == self.derive_final_target(self.question):
+            return (
+                "You are using NiHaixia / GRAVEC for a math word problem.\n"
+                "Hard goal: compute the exact quantity asked by the final question, not an intermediate value.\n"
+                "Work from the desired outcome backward to the needed quantities, then calculate forward.\n"
+                "Verify that the final number answers the asked quantity before finalizing.\n\n"
+                f"Problem:\n{self.question}\n\n"
+                "Known verified variables so far:\n"
+                f"{json.dumps(state, indent=2)}\n\n"
+                "Identify the requested quantity explicitly in your reasoning. "
+                "If the problem asks for workers, money still needed, total time, distance between stops, "
+                "or another derived quantity, final_answer must be that derived quantity. "
+                "Do not output a setup variable such as x, a subtotal, a first stop distance, or a component count "
+                "unless that is exactly what the question asks.\n\n"
+                "At the very end, output exactly one final numeric answer in \\boxed{...}."
+            )
+
         prompt = self._base.prompt_forward_step(state, target_step, avoid)
         prompt += (
             "\nVerifier requirement: the JSON 'expr' must be executable with only numeric "
@@ -396,6 +418,15 @@ class GSM8KNiHaixiaSpec(NiHaixiaSpec):
 
     def merge_aliases(self, state: Workspace) -> Workspace:
         return self._base.merge_aliases(state)
+
+    def should_attempt_direct_goal(
+        self,
+        state: Workspace,
+        goal: str,
+        iteration: int,
+        avoid: Set[str],
+    ) -> bool:
+        return goal not in avoid
 
     # ------------------------------------------------------------------
     # V：价值判断

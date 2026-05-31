@@ -51,6 +51,7 @@ from ..core_nhx import (
     GoalRevision,
     NiHaixiaSpec,
     Observation,
+    ReasoningPolicy,
     ValueScore,
 )
 from ..llm import llm_call
@@ -117,7 +118,7 @@ class HumanEvalNiHaixiaSpec(NiHaixiaSpec):
             return {"passed": True, "errors": [], "error_count": 0}
         except AssertionError as e:
             return {"passed": False, "errors": [f"AssertionError: {e}"], "error_count": 1}
-        except Exception as e:
+        except Exception:
             tb = traceback.format_exc()
             short_tb = "\n".join(tb.splitlines()[-5:])
             return {"passed": False, "errors": [short_tb], "error_count": 1}
@@ -170,7 +171,7 @@ class HumanEvalNiHaixiaSpec(NiHaixiaSpec):
 
         if test_results and not test_results.get("passed", True):
             errors = test_results.get("errors", [])
-            context += f"\n\nTest failures:\n" + "\n".join(errors[:3])
+            context += "\n\nTest failures:\n" + "\n".join(errors[:3])
 
         avoid_str = ""
         if avoid:
@@ -211,7 +212,7 @@ class HumanEvalNiHaixiaSpec(NiHaixiaSpec):
 
         if test_results and not test_results.get("passed", True):
             errors = test_results.get("errors", [])
-            context += f"\n\nTest error output:\n" + "\n".join(errors[:3])
+            context += "\n\nTest error output:\n" + "\n".join(errors[:3])
 
         if approach:
             context += f"\n\nCurrent approach: {approach}"
@@ -273,6 +274,21 @@ class HumanEvalNiHaixiaSpec(NiHaixiaSpec):
 
     def merge_aliases(self, state: Workspace) -> Workspace:
         return state
+
+    def render_prompt_with_policy(
+        self,
+        prompt: str,
+        policy: ReasoningPolicy,
+        phase: str,
+    ) -> str:
+        return textwrap.dedent(f"""
+            {prompt}
+
+            GRAVEC candidate policy for this {phase} phase:
+            - {policy.name}: {policy.instruction}
+            Use this policy internally, but still return only the complete function
+            implementation in the requested Python code block.
+        """).strip()
 
     # ====================================================================
     # 新增方法 1：价值判断

@@ -401,6 +401,37 @@ class NiHaixiaSpec(ProblemSpec):
             ),
         )
 
+    def render_prompt_with_policy(
+        self,
+        prompt: str,
+        policy: ReasoningPolicy,
+        phase: str,
+    ) -> str:
+        """Render a policy into a prompt without breaking domain output contracts.
+
+        The default is deliberately no-op. Many specs require strict JSON, code,
+        or expression-only outputs; appending generic policy prose after those
+        contracts can make LLMs violate parseable formats. Specs that benefit
+        from explicit policy text can override this method.
+        """
+        return prompt
+
+    def should_attempt_direct_goal(
+        self,
+        state: Workspace,
+        goal: str,
+        iteration: int,
+        avoid: Set[str],
+    ) -> bool:
+        """Whether the controller may ask the LLM to compute the final goal now.
+
+        Direct goal attempts are useful for domains with strong executable
+        verifiers, but they can become one-shot guessing for weakly verified
+        math word problems. Specs may disable them until enough evidence has
+        been built in the workspace.
+        """
+        return goal not in avoid
+
 
 # ============================================================================
 # 第三部分：主循环 — 倪海厦版「以果决其行」六步曲
@@ -490,16 +521,6 @@ def reason_from_future_nhx(
         if attempt_counts[symbol] >= max_fails_per_var:
             avoid.add(symbol)
 
-    def attach_policy(prompt: str, policy: ReasoningPolicy) -> str:
-        return (
-            f"{prompt}\n\n"
-            "GRAVEC candidate-generation policy:\n"
-            f"- policy: {policy.name}\n"
-            f"- borrowed_styles: {', '.join(policy.borrowed_styles)}\n"
-            f"- instruction: {policy.instruction}\n"
-            "Return exactly the format requested by the domain spec."
-        )
-
     # ====================================================================
     # 主迭代循环：G → R → A → V → E → C
     # ====================================================================
@@ -534,8 +555,12 @@ def reason_from_future_nhx(
         # ================================================================
         # G (Goal/以果)：反向推理 — 从目标往回看
         # ================================================================
-        if goal not in avoid:
-            direct_prompt = attach_policy(spec.prompt_forward_step(state, goal, avoid), policy)
+        if spec.should_attempt_direct_goal(state, goal, iter_idx, avoid):
+            direct_prompt = spec.render_prompt_with_policy(
+                spec.prompt_forward_step(state, goal, avoid),
+                policy,
+                "direct",
+            )
             direct_raw = llm_call(direct_prompt, model=model, verbose=verbose)
             direct_state = state | spec.parse_workspace_update(direct_raw, state)
 
@@ -557,7 +582,11 @@ def reason_from_future_nhx(
         # ================================================================
         # G (Goal/以果)：反向推理 — 确定先决条件
         # ================================================================
-        g_prompt = attach_policy(spec.prompt_last_step(state, goal, avoid), policy)
+        g_prompt = spec.render_prompt_with_policy(
+            spec.prompt_last_step(state, goal, avoid),
+            policy,
+            "backward",
+        )
         raw_target_step_response = llm_call(g_prompt, model=model, verbose=verbose)
         target_step = spec.parse_target_step(raw_target_step_response)
 
@@ -572,7 +601,11 @@ def reason_from_future_nhx(
         # ================================================================
         # R (Reason/推理)：正向计算
         # ================================================================
-        r_prompt = attach_policy(spec.prompt_forward_step(state, target_step, avoid), policy)
+        r_prompt = spec.render_prompt_with_policy(
+            spec.prompt_forward_step(state, target_step, avoid),
+            policy,
+            "forward",
+        )
         forward_raw = llm_call(r_prompt, model=model, verbose=verbose)
         parsed_update = spec.parse_workspace_update(forward_raw, state)
 
