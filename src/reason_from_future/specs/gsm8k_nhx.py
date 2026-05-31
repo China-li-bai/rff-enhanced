@@ -25,6 +25,7 @@ from ..core_nhx import (
     GoalRevision,
     NiHaixiaSpec,
     Observation,
+    ReasoningPolicy,
     ValueScore,
 )
 from .gsm8k import GSM8KSpec
@@ -240,6 +241,65 @@ class GSM8KNiHaixiaSpec(NiHaixiaSpec):
             return abs(value)
         return abs(value - self.gold_numeric_answer) / abs(self.gold_numeric_answer)
 
+    def _reverse_verify(self, state: Workspace, step: str, value: float) -> tuple[bool, str]:
+        """自洽性验证：值能否从题目数字通过已知表达式推导出来？
+
+        这是 Math 层的核心——不偷看标准答案，只检查逻辑自洽性。
+        类比：倪师复诊只靠"望闻问切"，不偷看化验单。
+        """
+        record = self._step_records.get(step)
+        if not record or not record.verified:
+            return False, "无可验证的表达式记录"
+
+        if not record.expr:
+            return True, "直接赋值，无表达式需验证"
+
+        try:
+            calculated, _, _ = _safe_eval_expr(record.expr, self._numeric_state(state))
+            tolerance = max(1e-6, abs(value) * 1e-7)
+            if abs(calculated - value) <= tolerance:
+                return True, f"表达式自洽：{record.expr} = {calculated:g}"
+            return False, f"表达式不自洽：{record.expr} = {calculated:g} ≠ {value:g}"
+        except Exception as exc:
+            return False, f"表达式求值失败：{exc}"
+
+    def _trace_to_question_numbers(self, state: Workspace, step: str) -> tuple[bool, list[str]]:
+        """追踪变量是否可追溯到题目原始数字。
+
+        Math 层验证：一个可靠的答案应该能通过依赖链追溯到题目中的原始数字。
+        如果依赖链断裂（有未知依赖），说明推理不完整。
+        """
+        visited: set[str] = set()
+        path: list[str] = []
+        broken: list[str] = []
+
+        def dfs(var: str) -> None:
+            if var in visited:
+                return
+            visited.add(var)
+            record = self._step_records.get(var)
+            if not record:
+                broken.append(var)
+                return
+            if not record.deps:
+                if record.literal_numbers:
+                    mentioned = set(round(n, 10) for n in self._mentioned_numbers)
+                    literals = set(round(n, 10) for n in record.literal_numbers)
+                    if literals & mentioned:
+                        path.append(f"{var}←题目数字")
+                    else:
+                        path.append(f"{var}←外部数字")
+                else:
+                    broken.append(var)
+                return
+            for dep in record.deps:
+                dfs(dep)
+            path.append(var)
+
+        dfs(step)
+        is_complete = len(broken) == 0
+        return is_complete, path if is_complete else broken
+
     def _has_duplicate_value(self, state: Workspace, step: str, value: float) -> bool:
         for name, other in self._numeric_state(state).items():
             if name != step and abs(other - value) < 1e-9:
@@ -428,6 +488,20 @@ class GSM8KNiHaixiaSpec(NiHaixiaSpec):
     ) -> bool:
         return goal not in avoid
 
+    def render_prompt_with_policy(
+        self,
+        prompt: str,
+        policy: ReasoningPolicy,
+        phase: str,
+    ) -> str:
+        if not policy.instruction:
+            return prompt
+        return (
+            f"{prompt}\n\n"
+            f"GRAVEC control policy ({phase} phase, mode={policy.name}): "
+            f"{policy.instruction}"
+        )
+
     # ------------------------------------------------------------------
     # V：价值判断
     # ------------------------------------------------------------------
@@ -482,23 +556,29 @@ class GSM8KNiHaixiaSpec(NiHaixiaSpec):
 
         numeric_value = float(value)
         ok, violations, failure_code = self._constraint_check(state, step, numeric_value)
-        rel_error = self._relative_error_to_gold(numeric_value) if step == goal else None
         value_score, value_reason = self._structural_progress(state, step, goal)
+        self_consistent, consistency_msg = self._reverse_verify(state, step, numeric_value)
+        trace_ok, trace_info = self._trace_to_question_numbers(state, step)
 
         if not ok:
             obs_type = "deterioration"
             distance_change = "farther"
             content = f"约束违反: {'; '.join(violations)}"
         elif step == goal:
-            if rel_error is not None and rel_error < 1e-6:
+            if self_consistent and ok and trace_ok:
                 obs_type = "improvement"
                 distance_change = "closer"
-                content = "最终答案通过数值验效"
+                content = f"最终答案通过自洽性验证：{consistency_msg}"
+            elif self_consistent and ok and not trace_ok:
+                obs_type = "neutral"
+                distance_change = "same"
+                failure_code = "incomplete_trace"
+                content = f"最终答案自洽但依赖链断裂：{trace_info}"
             else:
                 obs_type = "deterioration"
                 distance_change = "farther"
-                failure_code = "final_wrong"
-                content = f"最终答案未通过验效，relative_error={rel_error}"
+                failure_code = "final_inconsistent"
+                content = f"最终答案未通过自洽性验证：{consistency_msg}"
         elif value_score >= 0.45:
             obs_type = "improvement"
             distance_change = "closer"
@@ -525,7 +605,10 @@ class GSM8KNiHaixiaSpec(NiHaixiaSpec):
             "failure_code": failure_code if not ok or obs_type != "improvement" else "",
             "distance_change": distance_change,
             "distance_to_goal": distance_change,
-            "relative_error_to_gold": rel_error,
+            "self_consistent": self_consistent,
+            "consistency_msg": consistency_msg,
+            "trace_complete": trace_ok,
+            "trace_info": trace_info,
             "deps": sorted(self._step_records.get(step, StepRecord(step, numeric_value)).deps),
         }
 
@@ -568,14 +651,15 @@ class GSM8KNiHaixiaSpec(NiHaixiaSpec):
         elif distance_change == "farther":
             score -= 0.3
 
-        rel_error = observation.data.get("relative_error_to_gold")
-        if isinstance(rel_error, (int, float)):
-            if rel_error < 1e-6:
-                score = 1.0
-            elif rel_error < 0.05:
-                score += 0.2
-            elif rel_error > 1.0:
-                score -= 0.2
+        if observation.data.get("self_consistent", True):
+            score += 0.15
+        else:
+            score -= 0.25
+
+        if observation.data.get("trace_complete", True):
+            score += 0.1
+        else:
+            score -= 0.15
 
         if observation.data.get("contradictions"):
             score -= 0.35
@@ -607,6 +691,24 @@ class GSM8KNiHaixiaSpec(NiHaixiaSpec):
 
         failed_steps = [str(o.data.get("step", "")) for o in recent if o.data.get("step")]
         self._soft_revision_count += 1
+
+        subgoal = self._find_missing_prerequisite(state, goal)
+        if subgoal and subgoal != goal:
+            self._soft_goal_hint = (
+                f"果行共变：硬目标 {goal} 暂时无法直接达成，"
+                f"重定向到缺失的前驱变量 {subgoal}。"
+                f"已失败步骤：{failed_steps}"
+            )
+            return GoalRevision(
+                revised_goal=subgoal,
+                revision_reason=(
+                    f"通往 {goal} 的依赖链断裂，缺失前驱变量 {subgoal}。"
+                    f"已失败步骤：{failed_steps}。先攻克 {subgoal}，再回攻 {goal}。"
+                ),
+                confidence=0.8,
+                keep_old_as_subgoal=True,
+            )
+
         self._soft_goal_hint = (
             "Keep the hard goal as final_answer, but change the soft path: "
             f"avoid low-value or failing steps {failed_steps}; choose a prerequisite "
@@ -619,6 +721,38 @@ class GSM8KNiHaixiaSpec(NiHaixiaSpec):
             confidence=0.75,
             keep_old_as_subgoal=True,
         )
+
+    def _find_missing_prerequisite(self, state: Workspace, goal: str) -> Optional[str]:
+        """从依赖图中找到通往 goal 的缺失前驱变量。
+
+        果行共变的核心：不是"硬冲目标"，而是"先攻克前驱"。
+        类比：倪师说"要治失眠（goal），先得治肝火（prerequisite）"。
+        """
+        record = self._step_records.get(goal)
+        if not record or not record.deps:
+            return None
+
+        missing_deps = [dep for dep in record.deps if dep not in state]
+        if missing_deps:
+            return missing_deps[0]
+
+        edges = self._dependency_edges()
+        queue: deque[tuple[str, int]] = deque([(goal, 0)])
+        visited = {goal}
+
+        while queue:
+            node, dist = queue.popleft()
+            node_record = self._step_records.get(node)
+            if not node_record:
+                continue
+            for dep in node_record.deps:
+                if dep not in state and dep not in visited:
+                    return dep
+                if dep not in visited:
+                    visited.add(dep)
+                    queue.append((dep, dist + 1))
+
+        return None
 
     # ------------------------------------------------------------------
     # C：因果诊断
@@ -648,12 +782,20 @@ class GSM8KNiHaixiaSpec(NiHaixiaSpec):
                 confidence=0.85,
             )
 
-        if failure_code == "final_wrong":
+        if failure_code == "final_inconsistent":
             return CausalDiagnosis(
                 failure_type="wrong_direction",
-                description="最终答案与 gold answer 不一致",
+                description="最终答案未通过自洽性验证，表达式与值不一致",
                 suggested_fix="回退到上一个有效中间量，重新组合公式",
                 confidence=0.9,
+            )
+
+        if failure_code == "incomplete_trace":
+            return CausalDiagnosis(
+                failure_type="insufficient_effort",
+                description="最终答案自洽但依赖链断裂，推理步骤不完整",
+                suggested_fix="补充缺失的中间变量，建立从题目数字到最终答案的完整推导链",
+                confidence=0.8,
             )
 
         if failure_code == "duplicate_value":

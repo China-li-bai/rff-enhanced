@@ -194,11 +194,14 @@ class CausalDiagnosis:
 
 @dataclass(frozen=True)
 class ReasoningPolicy:
-    """Candidate-generation policy borrowed from established reasoning styles.
+    """Candidate-generation control contract for GRAVEC.
 
-    GRAVEC remains the controller: it decides when to use a compact draft,
-    branch search, algorithmic planning, or final short answer. The policy is
-    intentionally advisory so domain specs keep deterministic verification.
+    The reliable core is deliberately narrow:
+    - preserve the domain output format, so parsing and verification stay stable;
+    - feed verifier observations back into the next attempt.
+
+    `borrowed_styles` is kept for backward-compatible result metadata, but the
+    core controller does not depend on external reasoning-style labels.
     """
 
     name: str
@@ -345,17 +348,17 @@ class NiHaixiaSpec(ProblemSpec):
         observations: List[Observation],
         avoid: Set[str],
     ) -> ReasoningPolicy:
-        """Choose how the next LLM candidate should be generated.
+        """Choose the next format/feedback control mode.
 
-        This is where GRAVEC borrows useful parts of CoT/AoT/ToT/CoD/SoT
-        without giving up deterministic value judgment, effect checking, and
-        causal diagnosis.
+        GRAVEC's dependable behavior is not a prompt style. It is the loop:
+        fixed hard goal → formatted candidate → deterministic observation →
+        feedback-guided retry when the effect is poor.
         """
         if self.check_local(state, goal):
             return ReasoningPolicy(
-                name="sot_finalize",
-                borrowed_styles=("SoT",),
-                instruction="Keep only the final verified answer. Do not expand the reasoning.",
+                name="format_finalize",
+                borrowed_styles=(),
+                instruction="Return only the already verified final format. Do not add extra text.",
             )
 
         if observations:
@@ -365,39 +368,39 @@ class NiHaixiaSpec(ProblemSpec):
                 1 for obs in recent if obs.observation_type in {"neutral", "surprise"}
             )
             if bad_count >= 1 and iteration >= 1:
+                latest = recent[-1]
                 return ReasoningPolicy(
-                    name="tot_branch_repair",
-                    borrowed_styles=("ToT", "CoD"),
+                    name="feedback_repair",
+                    borrowed_styles=(),
                     instruction=(
-                        "Consider multiple candidate fixes internally, reject branches that repeat known failures, "
-                        "then output only the single best next step or workspace update."
+                        "Use the verifier feedback to repair the next candidate while preserving the required "
+                        f"output format. Latest feedback: {latest.content}"
                     ),
                 )
             if stagnant_count >= 2 or avoid:
                 return ReasoningPolicy(
-                    name="cod_compact_retry",
-                    borrowed_styles=("CoD", "SoT"),
+                    name="feedback_guided_retry",
+                    borrowed_styles=(),
                     instruction=(
-                        "Use a compact draft-refine pass: preserve only the decisive variables, avoid repeated "
-                        "low-value steps, and output the required structured result."
+                        "Avoid repeated low-value or failing steps and produce one parseable candidate in the "
+                        f"required format. Avoid list: {sorted(avoid)}"
                     ),
                 )
 
         if iteration == 0:
             return ReasoningPolicy(
-                name="cot_aot_initial_plan",
-                borrowed_styles=("CoT", "AoT"),
+                name="format_first_attempt",
+                borrowed_styles=(),
                 instruction=(
-                    "Use stepwise reasoning with an algorithmic plan: define the necessary subgoal, compute it, "
-                    "and make the result easy for the verifier to check."
+                    "Generate the first candidate in the exact domain format so it can be parsed and verified."
                 ),
             )
 
         return ReasoningPolicy(
-            name="aot_forward_progress",
-            borrowed_styles=("AoT", "CoT"),
+            name="feedback_guided_retry",
+            borrowed_styles=(),
             instruction=(
-                "Continue with the most direct algorithmic step toward the hard goal and output one structured result."
+                "Use accumulated feedback and current workspace state to produce the next parseable candidate."
             ),
         )
 

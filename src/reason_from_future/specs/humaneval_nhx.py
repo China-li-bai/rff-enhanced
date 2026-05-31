@@ -284,10 +284,10 @@ class HumanEvalNiHaixiaSpec(NiHaixiaSpec):
         return textwrap.dedent(f"""
             {prompt}
 
-            GRAVEC candidate policy for this {phase} phase:
+            GRAVEC format/feedback control for this {phase} phase:
             - {policy.name}: {policy.instruction}
-            Use this policy internally, but still return only the complete function
-            implementation in the requested Python code block.
+            Use this feedback internally, but still return only the complete
+            function implementation in the requested Python code block.
         """).strip()
 
     # ====================================================================
@@ -305,6 +305,18 @@ class HumanEvalNiHaixiaSpec(NiHaixiaSpec):
 
         if test_results.get("passed", False):
             return ValueScore(score=1.0, reason="代码已通过所有测试", is_primary=True)
+
+        errors = test_results.get("errors", [])
+        error_text = "\n".join(errors[:2])
+
+        if "SyntaxError" in error_text or "IndentationError" in error_text:
+            return ValueScore(score=0.8, reason="语法错误，修复成本低", is_primary=True)
+
+        if "TypeError" in error_text:
+            return ValueScore(score=0.7, reason="类型错误，方向可能正确", is_primary=False)
+
+        if "AssertionError" in error_text:
+            return ValueScore(score=0.6, reason="断言失败，逻辑基本正确但边界条件未处理", is_primary=False)
 
         if debug_attempts <= 2:
             return ValueScore(score=0.7, reason="早期调试，方向可能正确", is_primary=False)
