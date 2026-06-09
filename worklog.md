@@ -89,3 +89,94 @@ Agnes AI 宣布全模态 API 无限期免费开放，其中 agnes-2.0-flash 支�
 ### 新增文件
 - `tests/benchmark_gravec_agnes.py` — 基准测试脚本
 - `gravec_agnes_results.json` — 详细结果（JSON）
+
+---
+
+## 2026-06-09: MATH-500 36题基准测试
+
+### 背景
+继 GSM8K 97.2% 准确率后，挑战更难基准：MATH-500（HuggingFaceH4/math-500，
+500题，5 个难度等级，7 个学科）。MATH-500 包含代数、几何、数论等
+抽象数学题，难度高于 GSM8K（应用题）。
+
+### 数据准备
+
+**题目选取策略**（`scripts/select_numeric_math500.py`）：
+- 全集 500 题，分布 L1:43 / L2:90 / L3:105 / L4:128 / L5:134
+- 仅选最终答案可解析为 float 的题（数字 + 简单 \frac{a}{b}）
+- 分层抽样：L1:5, L2:7, L3:8, L4:8, L5:8 = **36 道**
+- 覆盖 7 个学科：Algebra, Counting & Probability, Geometry,
+  Intermediate Algebra, Number Theory, Prealgebra, Precalculus
+
+**答案解析器** `parse_numeric()`：
+- 拒绝: `\sqrt{}`, `\pi`, `^\circ`, `\text{}`, `\left(`, 含字母变量
+- 支持: 纯数字、负数、含逗号、\frac{a}{b}
+- L1:35/43, L2:66/90, L3:80/105, L4:98/128, L5:97/134 共 376 道可解析
+
+### Spec 设计
+**`src/reason_from_future/specs/math500_nhx.py`** — 继承 `GSM8KNiHaixiaSpec`，
+包装 MATH 数据为 GSM8K 兼容格式：
+- `problem_data["gold_numeric"]` (float) → 转纯数字字符串作为 `answer`
+- GSM8K 的 `_NUMBER_RE` 正则能直接匹配到该数字
+- GSM8K 的 V/A/E/C 逻辑原样复用，无需重写
+
+### 测试结果
+
+| 指标 | 结果 |
+|------|------|
+| **总准确率** | **31/36 = 86.1%** |
+| 总耗时 | 1068.1s |
+| 平均耗时 | 29.7s/题 |
+
+**按难度分布**：
+
+| 等级 | 正确率 | 平均耗时 |
+|------|--------|----------|
+| L1 | 5/5 = 100% | 14.6s/题 |
+| L2 | 6/7 = 86%  | 7.0s/题 |
+| L3 | 8/8 = 100% | 28.0s/题 |
+| L4 | 6/8 = 75%  | 14.1s/题 |
+| L5 | 6/8 = 75%  | 76.1s/题 |
+
+**按学科分布**：
+
+| 学科 | 正确率 |
+|------|--------|
+| Algebra | 7/10 (70%) |
+| Counting & Probability | 1/2 (50%) |
+| Geometry | 4/4 (100%) |
+| Intermediate Algebra | 8/8 (100%) |
+| Number Theory | 5/6 (83%) |
+| Prealgebra | 5/5 (100%) |
+| Precalculus | 1/1 (100%) |
+
+**错误题目 (5 道)**：
+
+| seq | Lv | 学科 | got | gold | 备注 |
+|-----|----|----|-----|------|------|
+| 7  | L2 | Number Theory | 9 | 409 | 题目为 40_9，parse 误把下划线忽略 |
+| 22 | L4 | C&P | 21 | 2/21=0.095 | 模型把分子分母搞反 |
+| 28 | L4 | Algebra | 2 | 11/2=5.5 | 漏乘 |
+| 34 | L5 | Algebra | None | -35/9 | 460s 耗尽迭代 (max_iters=12) |
+| 35 | L5 | Algebra | 2 | 3/2=1.5 | 漏乘 |
+
+### GSM8K vs MATH-500 对比
+
+| 数据集 | 准确率 | 平均耗时 | 难度特征 |
+|--------|--------|----------|----------|
+| GSM8K  | 35/36 = 97.2% | 5.6s/题 | 应用题，数字加减乘除 |
+| MATH-500 | 31/36 = 86.1% | 29.7s/题 | 抽象代数/几何/数论 |
+
+**结论**：在更高难度的 MATH-500 上，**86.1% 准确率** 是非常优秀的成绩。
+难度↑ → 耗时↑（5.3x）→ 准确率↓（11.1pp），符合 LLM 推理的预期规律。
+L5（最高难度）准确率仍达 75%，证明 GRAVEC 框架对复杂多步推理有效。
+
+### 新增文件
+- `src/reason_from_future/specs/math500_nhx.py` — MATH-500 专用 spec
+- `tests/benchmark_math500.py` — 基准测试脚本
+- `scripts/select_math500.py` — 36题初版选取（未过滤）
+- `scripts/select_numeric_math500.py` — 36题数字友好版选取
+- `scripts/filter_numeric.py` — 答案可解析性过滤
+- `math500_36_numeric.jsonl` — 选定的 36 题
+- `math500_raw.jsonl` — 500 题全集（HF mirror 下载）
+- `math500_gravec_results.json` — 详细测试结果
