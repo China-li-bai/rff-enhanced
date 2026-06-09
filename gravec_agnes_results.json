@@ -1,0 +1,371 @@
+{
+  "model": "openai/agnes-2.0-flash",
+  "engine": "GRAVEC v2 (reason_from_future_nhx)",
+  "total": 36,
+  "correct": 35,
+  "accuracy": 97.22222222222221,
+  "total_time": 200.3,
+  "avg_time": 5.6,
+  "results": [
+    {
+      "seq": 1,
+      "question": "A robe takes 2 bolts of blue fiber and half that much white ...",
+      "answer": "3.0",
+      "numeric_answer": 3.0,
+      "gold": 3.0,
+      "correct": true,
+      "elapsed": 2.94,
+      "error": null
+    },
+    {
+      "seq": 8,
+      "question": "Tom's ship can travel at 10 miles per hour.  He is sailing f...",
+      "answer": "5.0",
+      "numeric_answer": 5.0,
+      "gold": 5.0,
+      "correct": true,
+      "elapsed": 3.57,
+      "error": null
+    },
+    {
+      "seq": 31,
+      "question": "Russell works at a pet store and is distributing straw among...",
+      "answer": "5.0",
+      "numeric_answer": 5.0,
+      "gold": 5.0,
+      "correct": true,
+      "elapsed": 11.18,
+      "error": null
+    },
+    {
+      "seq": 57,
+      "question": "Nick, Richard, Jason and DJ each have paintball guns. DJ has...",
+      "answer": "6.0",
+      "numeric_answer": 6.0,
+      "gold": 6.0,
+      "correct": true,
+      "elapsed": 3.37,
+      "error": null
+    },
+    {
+      "seq": 66,
+      "question": "15 gallons of gas were equally divided into 5 different cont...",
+      "answer": "6.0",
+      "numeric_answer": 6.0,
+      "gold": 6.0,
+      "correct": true,
+      "elapsed": 5.55,
+      "error": null
+    },
+    {
+      "seq": 77,
+      "question": "Mary has 6 jars of sprinkles in her pantry. Each jar of spri...",
+      "answer": "4.0",
+      "numeric_answer": 4.0,
+      "gold": 4.0,
+      "correct": true,
+      "elapsed": 10.92,
+      "error": null
+    },
+    {
+      "seq": 87,
+      "question": "Emma can make and upload 72 vlogs per month. But she was onl...",
+      "answer": "18.0",
+      "numeric_answer": 18.0,
+      "gold": 18.0,
+      "correct": true,
+      "elapsed": 3.7,
+      "error": null
+    },
+    {
+      "seq": 98,
+      "question": "Jamaal is at the gym. He has been using an 8-pound weight. H...",
+      "answer": "10.0",
+      "numeric_answer": 10.0,
+      "gold": 10.0,
+      "correct": true,
+      "elapsed": 3.33,
+      "error": null
+    },
+    {
+      "seq": 124,
+      "question": "Four friends ordered four pizzas for a total of 64 dollars. ...",
+      "answer": "17.0",
+      "numeric_answer": 17.0,
+      "gold": 17.0,
+      "correct": true,
+      "elapsed": 3.87,
+      "error": null
+    },
+    {
+      "seq": 146,
+      "question": "Adam bought himself some new trousers for $30. His mother ga...",
+      "answer": "12.0",
+      "numeric_answer": 12.0,
+      "gold": 12.0,
+      "correct": true,
+      "elapsed": 3.33,
+      "error": null
+    },
+    {
+      "seq": 157,
+      "question": "The bananas at the supermarket cost $0.80 each, or a bunch f...",
+      "answer": "2.0",
+      "numeric_answer": 2.0,
+      "gold": 2.0,
+      "correct": true,
+      "elapsed": 4.03,
+      "error": null
+    },
+    {
+      "seq": 183,
+      "question": "Aiden is making his famous steakhouse-seasoned meatballs for...",
+      "answer": "10.0",
+      "numeric_answer": 10.0,
+      "gold": 10.0,
+      "correct": true,
+      "elapsed": 10.17,
+      "error": null
+    },
+    {
+      "seq": 4,
+      "question": "In a dance class of 20 students, 20% enrolled in contemporar...",
+      "answer": "60.0",
+      "numeric_answer": 60.0,
+      "gold": 60.0,
+      "correct": true,
+      "elapsed": 3.56,
+      "error": null
+    },
+    {
+      "seq": 24,
+      "question": "Jordan plays video games for 2 hours every day. He also has ...",
+      "answer": "140.0",
+      "numeric_answer": 140.0,
+      "gold": 140.0,
+      "correct": true,
+      "elapsed": 3.45,
+      "error": null
+    },
+    {
+      "seq": 41,
+      "question": "Steve decides to start eating more tomatoes and decides to g...",
+      "answer": "14.0",
+      "numeric_answer": 14.0,
+      "gold": 21.0,
+      "correct": false,
+      "elapsed": 7.29,
+      "error": null
+    },
+    {
+      "seq": 54,
+      "question": "Oscar has 24 lollipops and eats 2 on his way to school.  He ...",
+      "answer": "31.0",
+      "numeric_answer": 31.0,
+      "gold": 31.0,
+      "correct": true,
+      "elapsed": 2.51,
+      "error": null
+    },
+    {
+      "seq": 74,
+      "question": "Grayson recycles cans and bottles for money each week. An al...",
+      "answer": "84.0",
+      "numeric_answer": 84.0,
+      "gold": 84.0,
+      "correct": true,
+      "elapsed": 2.93,
+      "error": null
+    },
+    {
+      "seq": 95,
+      "question": "Liam and Mitchell own competing lemonade stands across the s...",
+      "answer": "21.0",
+      "numeric_answer": 21.0,
+      "gold": 21.0,
+      "correct": true,
+      "elapsed": 2.55,
+      "error": null
+    },
+    {
+      "seq": 110,
+      "question": "Students in class 3B are collecting school points for behavi...",
+      "answer": "145.0",
+      "numeric_answer": 145.0,
+      "gold": 145.0,
+      "correct": true,
+      "elapsed": 4.35,
+      "error": null
+    },
+    {
+      "seq": 125,
+      "question": "John is raising money for a school trip. He has applied for ...",
+      "answer": "100.0",
+      "numeric_answer": 100.0,
+      "gold": 100.0,
+      "correct": true,
+      "elapsed": 3.17,
+      "error": null
+    },
+    {
+      "seq": 139,
+      "question": "A bus travels 60 miles per hour for 5 hours. A car travels 3...",
+      "answer": "60.0",
+      "numeric_answer": 60.0,
+      "gold": 60.0,
+      "correct": true,
+      "elapsed": 2.96,
+      "error": null
+    },
+    {
+      "seq": 160,
+      "question": "Tony is painting a room with four walls. The north and south...",
+      "answer": "144.0",
+      "numeric_answer": 144.0,
+      "gold": 144.0,
+      "correct": true,
+      "elapsed": 4.22,
+      "error": null
+    },
+    {
+      "seq": 170,
+      "question": "Gomer ate 5 less than 23 scoops of mashed potatoes.  If it t...",
+      "answer": "27.0",
+      "numeric_answer": 27.0,
+      "gold": 27.0,
+      "correct": true,
+      "elapsed": 3.55,
+      "error": null
+    },
+    {
+      "seq": 189,
+      "question": "The Kennel house keeps 3 German Shepherds and 2 Bulldogs. If...",
+      "answer": "147.0",
+      "numeric_answer": 147.0,
+      "gold": 147.0,
+      "correct": true,
+      "elapsed": 12.79,
+      "error": null
+    },
+    {
+      "seq": 2,
+      "question": "Toulouse has twice as many sheep as Charleston. Charleston h...",
+      "answer": "260.0",
+      "numeric_answer": 260.0,
+      "gold": 260.0,
+      "correct": true,
+      "elapsed": 3.63,
+      "error": null
+    },
+    {
+      "seq": 13,
+      "question": "Marilyn's first record sold 10 times as many copies as Haral...",
+      "answer": "8000.0",
+      "numeric_answer": 8000.0,
+      "gold": 8000.0,
+      "correct": true,
+      "elapsed": 4.62,
+      "error": null
+    },
+    {
+      "seq": 25,
+      "question": "John has 10 hectares of a pineapple field. There are 100 pin...",
+      "answer": "4000.0",
+      "numeric_answer": 4000.0,
+      "gold": 4000.0,
+      "correct": true,
+      "elapsed": 19.22,
+      "error": null
+    },
+    {
+      "seq": 44,
+      "question": "Each solid 10-foot section of a redwood tree weighs 400 poun...",
+      "answer": "5600.0",
+      "numeric_answer": 5600.0,
+      "gold": 5600.0,
+      "correct": true,
+      "elapsed": 20.03,
+      "error": null
+    },
+    {
+      "seq": 62,
+      "question": "Elliott is trying to walk 10,000 steps a day. He finished ha...",
+      "answer": "2000.0",
+      "numeric_answer": 2000.0,
+      "gold": 2000.0,
+      "correct": true,
+      "elapsed": 4.91,
+      "error": null
+    },
+    {
+      "seq": 84,
+      "question": "Frederick is making popsicles to sell and to save money he i...",
+      "answer": "1600.0",
+      "numeric_answer": 1600.0,
+      "gold": 1600.0,
+      "correct": true,
+      "elapsed": 3.64,
+      "error": null
+    },
+    {
+      "seq": 101,
+      "question": "James gets a job selling used cars.  He sold 10 cars that co...",
+      "answer": "17500.0",
+      "numeric_answer": 17500.0,
+      "gold": 17500.0,
+      "correct": true,
+      "elapsed": 9.68,
+      "error": null
+    },
+    {
+      "seq": 120,
+      "question": "George has 45% more pears than bananas. If George has 200 ba...",
+      "answer": "490.0",
+      "numeric_answer": 490.0,
+      "gold": 490.0,
+      "correct": true,
+      "elapsed": 2.26,
+      "error": null
+    },
+    {
+      "seq": 129,
+      "question": "While working at the restaurant, each of the forty customers...",
+      "answer": "1520.0",
+      "numeric_answer": 1520.0,
+      "gold": 1520.0,
+      "correct": true,
+      "elapsed": 3.63,
+      "error": null
+    },
+    {
+      "seq": 142,
+      "question": "A bakery has 40 less than seven times as many loaves of brea...",
+      "answer": "450.0",
+      "numeric_answer": 450.0,
+      "gold": 450.0,
+      "correct": true,
+      "elapsed": 1.82,
+      "error": null
+    },
+    {
+      "seq": 174,
+      "question": "A company sold 4000 gallons of milk in jars to Mr. Marcellus...",
+      "answer": "5600.0",
+      "numeric_answer": 5600.0,
+      "gold": 5600.0,
+      "correct": true,
+      "elapsed": 3.69,
+      "error": null
+    },
+    {
+      "seq": 180,
+      "question": "John decides to get a loan by mortgaging his home.  His hous...",
+      "answer": "40000.0",
+      "numeric_answer": 40000.0,
+      "gold": 40000.0,
+      "correct": true,
+      "elapsed": 3.84,
+      "error": null
+    }
+  ]
+}

@@ -49,3 +49,43 @@ src/reason_from_future/gravec/
 2. 将 GSM8KNiHaixiaSpec 适配到 gravec 架构
 3. 在 loop.py 中集成 Agent 调用（V/A/E/C 可配置启用）
 4. 编写 gravec 的单元测试
+
+---
+
+## 2026-06-02: Agnes AI 接入 + GSM8K 36题基准测试
+
+### 背景
+Agnes AI 宣布全模态 API 无限期免费开放，其中 agnes-2.0-flash 支持：
+- OpenAI 兼容接口（LiteLLM 直接支持）
+- Thinking 模式（深度推理）
+- 工具调用（function calling）
+- 256K 上下文 / 65.5K 最大输出
+- Clav-Eval General Leaderboard 排名第 9
+
+### 接入配置
+- Endpoint: `https://apihub.agnes-ai.com/v1`
+- Model: `openai/agnes-2.0-flash`（LiteLLM 前缀）
+- 配置文件: `llm_config.toml`（已在 .gitignore 中）
+
+### 测试设计
+- 数据集: GSM8K 200题中均匀选取 36 道
+- 分层: 简单12 + 中等12 + 困难12（按答案数值大小分层）
+- 引擎: GRAVEC v2 (reason_from_future_nhx)
+- 最大迭代: 12 | 最少迭代: 2
+
+### 测试结果
+
+| 指标 | 结果 |
+|------|------|
+| **总准确率** | **35/36 = 97.2%** |
+| 简单(<=20) | 12/12 = 100% |
+| 中等(20-200) | 11/12 = 92% |
+| 困难(>200) | 12/12 = 100% |
+| 平均耗时 | 5.6s/题 |
+| 总耗时 | 200.3s |
+
+唯一错误: seq=41, got=14.0, gold=21.0
+
+### 新增文件
+- `tests/benchmark_gravec_agnes.py` — 基准测试脚本
+- `gravec_agnes_results.json` — 详细结果（JSON）
