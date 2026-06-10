@@ -631,7 +631,22 @@ def reason_from_future_nhx(
             policy,
             "forward",
         )
-        forward_raw = llm_call(r_prompt, model=model, verbose=verbose)
+
+        if _tool_handler is not None:
+            # Tool-calling 路径：LLM 可以调用 sympy 精确计算
+            forward_result = llm_call_with_tools(
+                messages=[{"role": "user", "content": r_prompt}],
+                tool_handler=_tool_handler,
+                model=model,
+                max_tool_rounds=3,
+                verbose=verbose,
+            )
+            forward_raw = forward_result["content"]
+            if verbose and forward_result["tool_calls_count"] > 0:
+                print(f"[R-推理] Tool-calling: {forward_result['tool_calls_count']} 次工具调用")
+        else:
+            forward_raw = llm_call(r_prompt, model=model, verbose=verbose)
+
         parsed_update = spec.parse_workspace_update(forward_raw, state)
 
         llm_provided_var = None
