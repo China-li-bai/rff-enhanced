@@ -54,6 +54,7 @@ from typing import Any, List, Optional, Set
 
 from .core import ProblemSpec, Workspace
 from .llm import llm_call
+from .executors.tools import llm_call_with_tools, SympyToolHandler
 
 
 # ============================================================================
@@ -451,6 +452,7 @@ def reason_from_future_nhx(
     value_threshold: float = 0.2,
     effect_threshold: float = 0.1,
     max_goal_revisions: int = 3,
+    use_tools: bool = False,
 ) -> str:
     """倪海厦版「以果决其行」主循环。
 
@@ -525,6 +527,11 @@ def reason_from_future_nhx(
             avoid.add(symbol)
 
     # ====================================================================
+    # Tool-calling 初始化
+    # ====================================================================
+    _tool_handler = SympyToolHandler() if use_tools else None
+
+    # ====================================================================
     # 主迭代循环：G → R → A → V → E → C
     # ====================================================================
     for iter_idx in range(max_iters):
@@ -564,7 +571,22 @@ def reason_from_future_nhx(
                 policy,
                 "direct",
             )
-            direct_raw = llm_call(direct_prompt, model=model, verbose=verbose)
+
+            if _tool_handler is not None:
+                # Tool-calling 路径：LLM 可以调用 sympy 精确计算
+                direct_result = llm_call_with_tools(
+                    messages=[{"role": "user", "content": direct_prompt}],
+                    tool_handler=_tool_handler,
+                    model=model,
+                    max_tool_rounds=3,
+                    verbose=verbose,
+                )
+                direct_raw = direct_result["content"]
+                if verbose and direct_result["tool_calls_count"] > 0:
+                    print(f"[G-以果] Tool-calling: {direct_result['tool_calls_count']} 次工具调用")
+            else:
+                direct_raw = llm_call(direct_prompt, model=model, verbose=verbose)
+
             direct_state = state | spec.parse_workspace_update(direct_raw, state)
 
             if spec.check_local(direct_state, goal):

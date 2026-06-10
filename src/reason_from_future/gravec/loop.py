@@ -1,20 +1,26 @@
 """
-GRAVEC 控制面 — 确定性 G→R→A→V→E→C 主循环
+GRAVEC 控制面 — 策略路由 + 确定性 G→R→A→V→E→C 主循环
 
-这是"以果决其行"的纪律骨架：
+架构升级（PRISM 对齐）：
+  在 GRAVEC 六步曲之前，插入 Strategy Router（以果层）：
+    Router → 决定策略 → 执行对应路径
+
+  策略路径：
+    COT_DIRECT   → 1-2 次 LLM 调用直接出答案（简单题）
+    COT_VERIFY   → GRAVEC G→R→A→V→E→C + sympy（中等题）
+    TOT_VOTE     → 多路径 GRAVEC + 多数投票（困难题）
+    DEEP_GRAVEC  → 全量迭代 + sympy + 投票（极难题）
+
+  这就是"以果决其行"的完整实现——
+  果 = 策略目标（用哪种推理路径）
+  行 = 执行路径（CoT / GRAVEC / ToT+Vote / Deep GRAVEC）
+
+控制面纪律：
 - 循环顺序固定：G→R→A→V→E→C
 - 阈值判断确定性：value_threshold, effect_threshold
 - 停滞检测确定性：stagnation_window
 - 黑名单管理确定性：max_fails_per_var
 - 果行共变触发确定性：failure_type + max_goal_revisions
-
-智能面的 Agent 只在 V/A/E/C 四步被调用，
-但调用时机和后续分支完全由控制面决定。
-
-与 core_nhx.py 的关系：
-  本文件是 core_nhx.py 的重构版，核心逻辑不变，
-  但 V/A/E/C 四步从 spec 的确定性方法升级为 Agent-backed。
-  迁移期间两者并存，迁移完成后 core_nhx.py 可废弃。
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ from typing import List, Set
 
 from ..core import Workspace
 from ..llm import llm_call
+from ..router import RoutingPolicy, Strategy, StrategyDecision
 from .models import (
     CausalDiagnosis,
     GoalRevision,
@@ -45,6 +52,11 @@ def reason_from_future_gravec(
     value_threshold: float = 0.2,
     effect_threshold: float = 0.1,
     max_goal_revisions: int = 3,
+    early_stop: bool = True,
+    early_stop_window: int = 3,
+    early_stop_delta: float = 0.05,
+    confidence_early_exit: float = 0.95,
+    max_time_s: float = 300.0,
 ) -> str:
     """GRAVEC「以果决其行」主循环。
 
@@ -79,6 +91,11 @@ def reason_from_future_gravec(
         value_threshold: 价值判断阈值 — 低于此值的步骤会被降权
         effect_threshold: 验效阈值 — 低于此值触发因果诊断
         max_goal_revisions: 最大目标修正次数
+        early_stop: 是否启用早停机制
+        early_stop_window: 早停窗口大小（连续 N 次无进展则触发）
+        early_stop_delta: 早停进展阈值（进展小于此值视为无进展）
+        confidence_early_exit: 置信度早退阈值（高于此值且过 min_iters 可提前返回）
+        max_time_s: 最大耗时（秒），超时强制退出
 
     Returns:
         最终答案字符串
@@ -86,6 +103,8 @@ def reason_from_future_gravec(
     Raises:
         RuntimeError: 耗尽迭代次数仍未达成目标
     """
+    import time as _time
+
     state: Workspace = Workspace()
     goal: str = spec.derive_final_target(problem)
     original_goal: str = goal
@@ -100,6 +119,11 @@ def reason_from_future_gravec(
     observation_history: List[Observation] = []
     goal_revision_count: int = 0
     low_value_steps: List[str] = []
+
+    # Early Stop 追踪
+    _start_time: float = _time.time()
+    _effect_history: list[float] = []
+    _high_confidence_count: int = 0
 
     def register_fail(symbol: str) -> None:
         nonlocal attempt_counts, avoid
@@ -299,6 +323,10 @@ def reason_from_future_gravec(
         if verbose:
             print(f"[E-验效] 效果分={effect_score:.2f}")
 
+        # ---- Early Stop: 记录效果历史 ----
+        if early_stop:
+            _effect_history.append(effect_score)
+
         if effect_score < effect_threshold:
             # ---- 效果不好 → 因果诊断 ----
             diagnosis = spec.diagnose_cause(state, step_to_evaluate, observation, goal)
@@ -356,7 +384,310 @@ def reason_from_future_gravec(
             if ok:
                 return answer_from_llm
 
+        # ================================================================
+        # Early Stop 检查（C 层增强）
+        # ================================================================
+        if early_stop and iter_idx >= min_iters:
+            # 1. 超时检查
+            elapsed = _time.time() - _start_time
+            if elapsed > max_time_s:
+                if verbose:
+                    print(f"[C-早停] 超时 ({elapsed:.1f}s > {max_time_s:.1f}s), 强制退出")
+                # 尝试返回当前最佳答案
+                if spec.check_local(state, goal):
+                    if not require_gold:
+                        return str(state[goal])
+                    ok, answer_from_llm, _ = spec.verify_final(state)
+                    if ok:
+                        return answer_from_llm
+                raise RuntimeError(
+                    f"GRAVEC 超时 ({elapsed:.1f}s). "
+                    f"目标: {goal}, 已完成 {iter_idx + 1} 次迭代"
+                )
+
+            # 2. 连续无进展检查
+            if len(_effect_history) >= early_stop_window:
+                recent = _effect_history[-early_stop_window:]
+                avg_progress = sum(recent) / len(recent)
+                if avg_progress < early_stop_delta:
+                    if verbose:
+                        print(
+                            f"[C-早停] 连续 {early_stop_window} 次无进展 "
+                            f"(avg_effect={avg_progress:.3f} < {early_stop_delta}), "
+                            f"尝试提前返回"
+                        )
+                    # 尝试返回当前最佳答案
+                    if spec.check_local(state, goal):
+                        if not require_gold:
+                            return str(state[goal])
+                        ok, answer_from_llm, _ = spec.verify_final(state)
+                        if ok:
+                            return answer_from_llm
+                    # 无法返回有效答案，继续迭代但标记
+                    _effect_history.clear()
+
+            # 3. 高置信度早退
+            if observation.confidence >= confidence_early_exit:
+                _high_confidence_count += 1
+                if _high_confidence_count >= 2 and observation.observation_type == "improvement":
+                    if verbose:
+                        print(
+                            f"[C-早停] 高置信度早退 "
+                            f"(confidence={observation.confidence:.2f}, "
+                            f"连续高置信={_high_confidence_count})"
+                        )
+                    if spec.check_local(state, goal):
+                        if not require_gold:
+                            return str(state[goal])
+                        ok, answer_from_llm, _ = spec.verify_final(state)
+                        if ok:
+                            return answer_from_llm
+            else:
+                _high_confidence_count = 0
+
     raise RuntimeError(
         f"GRAVEC 耗尽迭代次数 (目标修正 {goal_revision_count} 次). "
         f"最终目标: {goal}, 原始目标: {original_goal}"
+    )
+
+
+# ============================================================================
+# 策略路由入口 — 以果决其行的"果"层
+# ============================================================================
+
+def reason_with_router(
+    problem: str,
+    spec: NiHaixiaSpec,
+    *,
+    max_iters: int = 16,
+    min_iters: int = 1,
+    require_gold: bool = True,
+    model: str | None = None,
+    verbose: bool = False,
+    difficulty_hint: int = 0,
+    strategy_override: Strategy | None = None,
+) -> str:
+    """策略路由入口：先路由，再执行。
+
+    这是"以果决其行"的完整实现——
+    在执行 GRAVEC 之前，先通过 Strategy Router 决定：
+    1. 该用什么策略（果）
+    2. 然后执行对应路径（行）
+
+    Args:
+        problem: 问题描述文本
+        spec: 倪海厦增强规约实例
+        max_iters: 最大迭代次数（被策略覆盖）
+        min_iters: 最少迭代次数
+        require_gold: 是否必须和标准答案匹配
+        model: LLM 模型名
+        verbose: 是否打印详细日志
+        difficulty_hint: 外部难度提示（如 MATH-500 的 level 标签）
+        strategy_override: 强制使用指定策略（跳过路由）
+
+    Returns:
+        最终答案字符串
+    """
+    # ---- 策略路由 ----
+    if strategy_override is not None:
+        decision = StrategyDecision(
+            strategy=strategy_override,
+            confidence=1.0,
+            reason="手动指定策略",
+            max_iters=strategy_override.max_iters,
+            vote_count=strategy_override.vote_count,
+            use_sympy=strategy_override.use_sympy,
+        )
+    else:
+        routing_policy = RoutingPolicy(llm_call=llm_call, model=model)
+        decision = routing_policy.route(problem, difficulty_hint=difficulty_hint)
+
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"[策略路由] {decision.strategy.value}")
+        print(f"  理由: {decision.reason}")
+        print(f"  置信度: {decision.confidence:.2f}")
+        print(f"  最大迭代: {decision.max_iters}")
+        print(f"  投票数: {decision.vote_count}")
+        print(f"  sympy: {decision.use_sympy}")
+        print(f"  预估耗时: {decision.estimated_time_s:.0f}s")
+        print(f"{'='*60}")
+
+    # ---- 根据策略执行 ----
+    if decision.strategy == Strategy.COT_DIRECT:
+        return _execute_cot_direct(problem, spec, model=model, verbose=verbose)
+    elif decision.strategy == Strategy.COT_VERIFY:
+        return reason_from_future_gravec(
+            problem, spec,
+            max_iters=decision.max_iters,
+            min_iters=min_iters,
+            require_gold=require_gold,
+            model=model,
+            verbose=verbose,
+        )
+    elif decision.strategy == Strategy.TOT_VOTE:
+        return _execute_tot_vote(
+            problem, spec,
+            vote_count=decision.vote_count,
+            max_iters=decision.max_iters,
+            min_iters=min_iters,
+            require_gold=require_gold,
+            model=model,
+            verbose=verbose,
+        )
+    elif decision.strategy == Strategy.DEEP_GRAVEC:
+        return _execute_deep_gravec(
+            problem, spec,
+            max_iters=decision.max_iters,
+            min_iters=min_iters,
+            require_gold=require_gold,
+            model=model,
+            verbose=verbose,
+        )
+    else:
+        # fallback
+        return reason_from_future_gravec(
+            problem, spec,
+            max_iters=max_iters,
+            min_iters=min_iters,
+            require_gold=require_gold,
+            model=model,
+            verbose=verbose,
+        )
+
+
+def _execute_cot_direct(
+    problem: str,
+    spec: NiHaixiaSpec,
+    *,
+    model: str | None = None,
+    verbose: bool = False,
+) -> str:
+    """COT_DIRECT 策略：1-2 次 LLM 调用直接出答案。
+
+    适用于简单题（L1-L2），不需要迭代修复。
+    """
+    goal = spec.derive_final_target(problem)
+
+    # 第 1 次：直接求解
+    prompt = spec.prompt_forward_step(Workspace(), goal, set())
+    raw = llm_call(prompt, model=model, verbose=verbose)
+    parsed = spec.parse_workspace_update(raw, Workspace())
+
+    if parsed and goal in parsed:
+        state = Workspace(parsed)
+        if spec.check_local(state, goal):
+            ok, answer, _ = spec.verify_final(state)
+            if ok:
+                return answer
+
+    # 第 2 次：换一种问法
+    prompt2 = (
+        f"Solve this problem step by step and give ONLY the final numerical answer:\n\n"
+        f"{problem}"
+    )
+    raw2 = llm_call(prompt2, model=model, verbose=verbose)
+    parsed2 = spec.parse_workspace_update(raw2, Workspace())
+
+    if parsed2 and goal in parsed2:
+        state2 = Workspace(parsed2)
+        if spec.check_local(state2, goal):
+            ok2, answer2, _ = spec.verify_final(state2)
+            if ok2:
+                return answer2
+
+    # fallback: 走标准 GRAVEC
+    return reason_from_future_gravec(
+        problem, spec, max_iters=6, min_iters=1,
+        require_gold=False, model=model, verbose=verbose,
+    )
+
+
+def _execute_tot_vote(
+    problem: str,
+    spec: NiHaixiaSpec,
+    *,
+    vote_count: int = 3,
+    max_iters: int = 8,
+    min_iters: int = 1,
+    require_gold: bool = True,
+    model: str | None = None,
+    verbose: bool = False,
+) -> str:
+    """TOT_VOTE 策略：多路径 GRAVEC + 多数投票。
+
+    适用于困难题（L4），需要多种解法交叉验证。
+    """
+    from collections import Counter
+
+    answers: list[str] = []
+    for i in range(vote_count):
+        try:
+            answer = reason_from_future_gravec(
+                problem, spec,
+                max_iters=max_iters,
+                min_iters=min_iters,
+                require_gold=require_gold,
+                model=model,
+                verbose=verbose and i == 0,  # 只打印第一次的详细日志
+            )
+            answers.append(answer)
+        except RuntimeError:
+            pass  # 某条路径失败，不影响投票
+
+    if not answers:
+        raise RuntimeError(f"TOT_VOTE: 所有 {vote_count} 条路径均失败")
+
+    # 多数投票
+    vote_counts = Counter(answers)
+    best_answer, count = vote_counts.most_common(1)[0]
+
+    if verbose:
+        print(f"\n[TOT_VOTE] 投票结果: {dict(vote_counts)}")
+        print(f"[TOT_VOTE] 胜出: {best_answer} (票数: {count}/{len(answers)})")
+
+    return best_answer
+
+
+def _execute_deep_gravec(
+    problem: str,
+    spec: NiHaixiaSpec,
+    *,
+    max_iters: int = 16,
+    min_iters: int = 2,
+    require_gold: bool = True,
+    model: str | None = None,
+    verbose: bool = False,
+) -> str:
+    """DEEP_GRAVEC 策略：全量迭代 + 投票。
+
+    适用于极难题（L5），需要深度迭代+反复修正。
+    先跑一次全量 GRAVEC，如果失败则多路径投票。
+    """
+    # 第 1 次：全量 GRAVEC
+    try:
+        answer = reason_from_future_gravec(
+            problem, spec,
+            max_iters=max_iters,
+            min_iters=min_iters,
+            require_gold=require_gold,
+            model=model,
+            verbose=verbose,
+        )
+        return answer
+    except RuntimeError:
+        pass
+
+    # 全量失败 → 多路径投票（3 条路径）
+    if verbose:
+        print("[DEEP_GRAVEC] 全量迭代失败，启动多路径投票...")
+
+    return _execute_tot_vote(
+        problem, spec,
+        vote_count=3,
+        max_iters=max(8, max_iters // 2),
+        min_iters=min_iters,
+        require_gold=require_gold,
+        model=model,
+        verbose=verbose,
     )

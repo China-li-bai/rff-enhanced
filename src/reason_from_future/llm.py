@@ -122,6 +122,7 @@ def llm_call(
     kwargs: dict = {
         "model": use_model,
         "messages": messages,
+        "timeout": 120,  # 2 分钟超时，防止 API 卡死
     }
 
     if DEFAULT_API_KEY:

@@ -12,11 +12,13 @@ Agent A 的能力：
   1. 调工具（运行代码、执行测试、搜索文档）
   2. 产生新信息（不只是验证旧信息）
   3. 多步执行（一个 action 可以调多个工具）
+  4. sympy 精确计算（替代 LLM 心算，消除算术错误）
 
 设计原则：
   - 保留确定性 fallback（spec.execute_action）
   - Agent 结果与确定性接口兼容（都是 Observation）
   - 工具通过 ToolRegistry 注册和调用
+  - SympyExecutor 提供精确计算，LLM 心算作为 fallback
 """
 
 from __future__ import annotations
@@ -24,18 +26,19 @@ from __future__ import annotations
 from typing import Any
 
 from ...core import Workspace
+from ...executors import SympyExecutor, ExecutionResult
 from ..models import Observation
 
 
 class ActionAgent:
-    """A Agent：行动执行（可调工具）。
+    """A Agent：行动执行（可调工具 + sympy 精确计算）。
 
     与确定性 execute_action 的区别：
     - 确定性：只能验证（自洽性检查、AST 求值）
-    - Agent：可以调工具、产生新信息
+    - Agent：可以调工具、产生新信息、sympy 精确计算
 
     Usage:
-        agent = ActionAgent(llm_call=llm_call, tool_registry=registry)
+        agent = ActionAgent(llm_call=llm_call, tool_registry=registry, sympy_executor=executor)
         result = agent.execute(state, step, goal, fallback=deterministic_obs)
     """
 
@@ -44,10 +47,12 @@ class ActionAgent:
         llm_call: Any = None,
         model: str | None = None,
         tool_registry: Any = None,
+        sympy_executor: SympyExecutor | None = None,
     ):
         self._llm_call = llm_call
         self._model = model
         self._tool_registry = tool_registry
+        self._sympy_executor = sympy_executor
 
     def execute(
         self,
@@ -56,30 +61,113 @@ class ActionAgent:
         goal: str,
         *,
         fallback: Observation | None = None,
+        use_sympy: bool = True,
     ) -> Observation:
-        """行动执行（可调工具）。
+        """行动执行（可调工具 + sympy 精确计算）。
+
+        执行优先级：
+        1. sympy 精确计算（如果启用且有 executor）
+        2. 工具调用（如果有 tool_registry）
+        3. 确定性 fallback
 
         Args:
             state: 当前工作台状态
             step: 待执行的步骤
             goal: 当前目标
             fallback: 确定性 fallback 结果
+            use_sympy: 是否尝试 sympy 精确计算
 
         Returns:
             Observation，与确定性接口完全兼容
         """
-        # 如果没有工具注册中心，直接 fallback
-        if self._tool_registry is None or not self._tool_registry.has_tools():
-            return fallback or Observation(content="no tools available")
+        # 优先级 1: sympy 精确计算
+        if use_sympy and self._sympy_executor is not None and self._llm_call is not None:
+            sympy_obs = self._try_sympy(state, step, goal)
+            if sympy_obs is not None:
+                return sympy_obs
 
-        # 如果没有 LLM，无法决定调哪个工具
-        if self._llm_call is None:
-            return fallback or Observation(content="no LLM available")
+        # 优先级 2: 工具调用
+        if self._tool_registry is not None and self._tool_registry.has_tools() and self._llm_call is not None:
+            tool_obs = self._try_tools(state, step, goal, fallback)
+            if tool_obs is not None:
+                return tool_obs
 
-        prompt = self._build_prompt(state, step, goal)
+        # 优先级 3: 确定性 fallback
+        return fallback or Observation(content="no execution path available")
+
+    def _try_sympy(
+        self,
+        state: Workspace,
+        step: str,
+        goal: str,
+    ) -> Observation | None:
+        """尝试用 sympy 精确计算。"""
+        if self._llm_call is None or self._sympy_executor is None:
+            return None
+
+        # 让 LLM 生成 sympy 代码
+        known_vars = dict(state.items())
+        prompt = self._sympy_executor.generate_code_prompt(step, known_vars)
         raw = self._llm_call(prompt, model=self._model)
 
+        # 提取代码
+        code = self._extract_code(raw)
+        if not code:
+            return None
+
+        # 执行代码
+        result = self._sympy_executor.execute(code, variables=known_vars)
+
+        if result.success:
+            return Observation(
+                content=f"sympy 精确计算结果: {result.result}",
+                data={
+                    "result": result.result,
+                    "result_type": result.result_type,
+                    "code": result.code,
+                    "variables": result.variables,
+                    "elapsed_s": result.elapsed_s,
+                },
+                observation_type="neutral",
+                confidence=0.95,  # sympy 结果置信度极高
+                channel="sympy",
+            )
+        else:
+            # sympy 执行失败，返回 None 让后续路径处理
+            return None
+
+    def _try_tools(
+        self,
+        state: Workspace,
+        step: str,
+        goal: str,
+        fallback: Observation | None,
+    ) -> Observation | None:
+        """尝试工具调用。"""
+        prompt = self._build_prompt(state, step, goal)
+        raw = self._llm_call(prompt, model=self._model)
         return self._execute_tools(raw, state, step, fallback)
+
+    @staticmethod
+    def _extract_code(raw: str) -> str:
+        """从 LLM 回复中提取 Python 代码。"""
+        text = raw.strip()
+        if "```python" in text:
+            parts = text.split("```python")
+            if len(parts) > 1:
+                code = parts[1].split("```")[0].strip()
+                return code
+        elif "```" in text:
+            parts = text.split("```")
+            if len(parts) > 1:
+                code = parts[1].strip()
+                if code.startswith("python"):
+                    code = code[6:].strip()
+                return code
+        # 没有代码块，尝试整段作为代码（如果看起来像代码）
+        if any(kw in text for kw in ["symbols(", "solve(", "Rational(", "result ="]):
+            return text
+        return ""
 
     def _build_prompt(
         self,
@@ -124,7 +212,7 @@ class ActionAgent:
         state: Workspace,
         step: str,
         fallback: Observation | None,
-    ) -> Observation:
+    ) -> Observation | None:
         """解析 LLM 的工具调用决策并执行。"""
         import json
 
@@ -139,13 +227,13 @@ class ActionAgent:
             data = json.loads(text)
 
             if data.get("action") != "use_tool":
-                return fallback or Observation(content="verify only, no tool needed")
+                return None  # verify_only → 让调用者走 fallback
 
             tool_name = data.get("tool_name", "")
             tool_args = data.get("tool_args", {})
 
             if not tool_name or not self._tool_registry:
-                return fallback or Observation(content="no tool specified")
+                return None
 
             result = self._tool_registry.call(tool_name, **tool_args)
 
@@ -156,9 +244,5 @@ class ActionAgent:
                 confidence=0.7,
                 channel="tool",
             )
-        except (json.JSONDecodeError, ValueError, KeyError, Exception) as e:
-            return fallback or Observation(
-                content=f"A Agent 执行失败: {e}",
-                observation_type="surprise",
-                confidence=0.3,
-            )
+        except (json.JSONDecodeError, ValueError, KeyError, Exception):
+            return None
