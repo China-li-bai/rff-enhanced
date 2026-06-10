@@ -46,6 +46,9 @@ from .gravec.tools import ToolRegistry
 # LLM interface（底层用 LiteLLM 抹平 100+ LLM 差异）
 from .llm import llm_call
 
+# Tool-calling 接口（LLM 主动调用 sympy 精确计算）
+from .executors.tools import llm_call_with_tools, SympyToolHandler, SYMPY_TOOL_SCHEMA
+
 # Example problem specifications
 from .specs import Game24Spec, GSM8KSpec, GSM8KNiHaixiaSpec, HumanEvalNiHaixiaSpec
 
@@ -78,6 +81,10 @@ __all__ = [
     "ToolRegistry",
     # from .llm
     "llm_call",
+    # from .executors.tools
+    "llm_call_with_tools",
+    "SympyToolHandler",
+    "SYMPY_TOOL_SCHEMA",
     # from .specs
     "Game24Spec",
     "GSM8KSpec",
