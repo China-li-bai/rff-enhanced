@@ -19,6 +19,8 @@ class ExecutionResult:
         result: 执行结果值（成功时）
         result_type: 结果类型（int, float, str, sympy.Basic, ...）
         error: 错误信息（失败时）
+        error_code: 结构化错误码（E_AST_BLOCK / E_SYNTAX / E_TIMEOUT / E_MEMORY / E_RUNTIME / E_INTERNAL）
+        error_hint: 修复提示（失败时，供 LLM 自动重试参考）
         code: 执行的代码
         elapsed_s: 执行耗时（秒）
         variables: 执行后的变量绑定
@@ -28,6 +30,8 @@ class ExecutionResult:
     result: Any = None
     result_type: str = ""
     error: str = ""
+    error_code: str = ""
+    error_hint: str = ""
     code: str = ""
     elapsed_s: float = 0.0
     variables: dict[str, Any] = field(default_factory=dict)

@@ -14,7 +14,7 @@ dependencies = [
     "chromium",
     "einops",
     "fastapi",
-    "gunicorn", 
+    "gunicorn",
     "google",
     "google-cloud-aiplatform",
     "google-genai",
@@ -42,11 +42,12 @@ dependencies = [
     "sentence-transformers",
     "shiny",
     "torch",
-    "torchvision", 
+    "torchvision",
     "torchaudio",
     "transformers",
     "unsloth",
     "uvicorn",
+    "fastmcp>=3.4.0",
 ]
 
 [dependency-groups]

@@ -7,29 +7,44 @@ SympyExecutor — sympy 精确计算执行器
   - 精确运算: Rational(1, 3) + Rational(1, 6) → 1/2
   - 代数运算: expand, factor, collect, ...
 
-安全措施：
+安全措施（v2 — 社区级 AST 安全检查）：
+  - AST 语法树级安全验证（源自 Eis4TY/sym-mcp）
+  - 白名单语法节点 + 禁止危险调用
+  - 结构化错误码 + 修复提示
   - restricted globals: 只暴露 sympy 和 math 函数
   - timeout: 默认 10 秒
-  - 无文件/网络访问
-  - 无 import 语句
 
 Usage:
     executor = SympyExecutor()
     result = executor.execute("x = symbols('x'); solve(Eq(x**2 - 4, 0), x)")
     # result.success = True
     # result.result = [-2, 2]
+    # result.error_code = ""  (成功时为空)
+    #
+    result = executor.execute("open('/etc/passwd')")
+    # result.success = False
+    # result.error = "安全拦截: 第 1 行禁止调用 `open`。"
+    # result.error_code = "E_AST_BLOCK"
 """
 
 from __future__ import annotations
 
+import linecache
 import time
+import traceback
 from typing import Any
 
 from .base import ExecutionResult
+from .security.ast_guard import validate_code
+from .security.error_parser import (
+    parse_guard_result,
+    parse_runtime_error,
+    parse_timeout_error,
+)
 
 
 class SympyExecutor:
-    """Sympy 精确计算执行器。"""
+    """Sympy 精确计算执行器（v2 — AST 安全检查 + 结构化错误码）。"""
 
     _SAFE_GLOBALS: dict[str, Any] = {}
 
@@ -101,49 +116,68 @@ class SympyExecutor:
         *,
         variables: dict[str, Any] | None = None,
     ) -> ExecutionResult:
-        """执行 sympy 代码。"""
+        """执行 sympy 代码。
+
+        安全流程：
+          1. AST 安全检查（白名单语法节点 + 禁止危险调用）
+          2. 自动剥离 import 语句（LLM 经常忽略"不要用 import"的指令）
+          3. 在受限环境中执行
+          4. 结构化错误报告（错误码 + 修复提示）
+        """
         start = time.time()
 
-        # 构建执行环境
-        exec_env: dict[str, Any] = dict(self._SAFE_GLOBALS)
-        if variables:
-            exec_env.update(variables)
-
-        # 安全检查
-        if not self._is_safe_code(code):
+        # ---- 第1步：AST 安全检查 ----
+        guard = validate_code(code)
+        if not guard.ok:
+            parsed = parse_guard_result(guard.message)
             result = ExecutionResult(
                 success=False,
-                error="代码包含不安全操作（import/open/exec/eval/compile）",
+                error=parsed.err,
+                error_code=parsed.code,
+                error_hint=parsed.hint,
                 code=code,
                 elapsed_s=time.time() - start,
             )
             self._last_execution = result
             return result
 
-        # 自动剥离 import 语句（LLM 经常忽略"不要用 import"的指令）
-        code = self._strip_imports(code)
+        # ---- 第2步：自动剥离 import 语句 ----
+        # AST 检查已允许 import sympy/math，但我们的预导入环境
+        # 不需要 LLM 再写 import，所以剥离以避免重复导入
+        code = _strip_imports(code)
 
-        # 执行
+        # ---- 第3步：构建执行环境并执行 ----
+        exec_env: dict[str, Any] = dict(self._SAFE_GLOBALS)
+        if variables:
+            exec_env.update(variables)
+
         try:
-            exec(code, exec_env)  # noqa: S102
+            # 注册源码到 linecache，使 traceback 能显示行号
+            linecache.cache["<user_code>"] = (
+                len(code), None,
+                [f"{line}\n" for line in code.splitlines()],
+                "<user_code>",
+            )
+            compiled = compile(code, "<user_code>", "exec")
+            exec(compiled, exec_env)  # noqa: S102
 
             # 提取结果
-            result = exec_env.get("result", exec_env.get("answer", None))
-            if result is None:
+            result_val = exec_env.get("result", exec_env.get("answer", None))
+            if result_val is None:
                 for key in reversed(list(exec_env.keys())):
                     val = exec_env[key]
                     if not key.startswith("_") and not callable(val) and key not in self._SAFE_GLOBALS:
-                        result = val
+                        result_val = val
                         break
 
             # sympy 类型转 Python 类型
-            result = self._sympy_to_python(result)
+            result_val = self._sympy_to_python(result_val)
 
             elapsed = time.time() - start
             result = ExecutionResult(
                 success=True,
-                result=result,
-                result_type=type(result).__name__,
+                result=result_val,
+                result_type=type(result_val).__name__,
                 code=code,
                 elapsed_s=elapsed,
                 variables={
@@ -154,55 +188,21 @@ class SympyExecutor:
             )
             self._last_execution = result
             return result
-        except Exception as e:
+
+        except Exception:
             elapsed = time.time() - start
+            tb_text = traceback.format_exc()
+            parsed = parse_runtime_error(tb_text)
             result = ExecutionResult(
                 success=False,
-                error=f"{type(e).__name__}: {e}",
+                error=parsed.err,
+                error_code=parsed.code,
+                error_hint=parsed.hint,
                 code=code,
                 elapsed_s=elapsed,
             )
             self._last_execution = result
             return result
-
-    @staticmethod
-    def _is_safe_code(code: str) -> bool:
-        """检查代码是否安全（排除 import 语句后检查）。"""
-        forbidden = [
-            "__import__",
-            "open(", "exec(", "eval(", "compile(",
-            "os.", "sys.", "subprocess.", "shutil.",
-            "globals()", "locals()", "vars(",
-            "getattr(", "setattr(", "delattr(",
-        ]
-        # 先剥离 import/from 语句（LLM 经常忽略"不要用 import"的指令）
-        lines = code.split("\n")
-        stripped_lines = []
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith("import ") or stripped.startswith("from "):
-                continue  # 跳过 import 行
-            stripped_lines.append(line)
-        stripped_code = "\n".join(stripped_lines)
-
-        # 在剥离 import 后的代码上做安全检查
-        code_lower = stripped_code.lower()
-        for f in forbidden:
-            if f.lower() in code_lower:
-                return False
-        return True
-
-    @staticmethod
-    def _strip_imports(code: str) -> str:
-        """剥离代码中的 import/from 语句。"""
-        lines = code.split("\n")
-        result = []
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith("import ") or stripped.startswith("from "):
-                continue
-            result.append(line)
-        return "\n".join(result)
 
     @staticmethod
     def _sympy_to_python(value: Any) -> Any:
@@ -265,3 +265,19 @@ class SympyExecutor:
 x = symbols('x')
 result = solve(Eq(x**2 - 4, 0), x)
 ```"""
+
+
+def _strip_imports(code: str) -> str:
+    """剥离代码中的 import/from 语句。
+
+    AST 检查已允许 import sympy/math，但我们的预导入环境
+    不需要 LLM 再写 import，所以剥离以避免重复导入。
+    """
+    lines = code.split("\n")
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("import ") or stripped.startswith("from "):
+            continue
+        result.append(line)
+    return "\n".join(result)

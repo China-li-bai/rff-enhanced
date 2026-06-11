@@ -297,3 +297,206 @@ GRAVEC 对复杂题目的处理能力被低估了。
 - `tests/benchmark_math500_100.py` — 100 题基准测试脚本
 - `math500_100_numeric.jsonl` — 选定的 100 题
 - `math500_100_gravec_results.json` — 详细测试结果
+
+---
+
+## 2026-06-11: SymPy Tool-Calling 改造 + FastMCP 标准化
+
+### 背景
+MATH-500 100题测试中，4/11 的错误是"分数反转"——LLM 心算 \frac{a}{b}
+时把分子分母搞反（如 11/36 算成 36）。根因是 LLM 不擅长精确算术。
+
+### 解决方案：LLM Function Calling + SymPy 预计算注入
+
+**核心思路**：让 LLM 自己调用 sympy_calculate 工具做计算，
+而不是心算后由外部验证。形成"推理→调用工具→看到结果→继续推理"的闭环。
+
+**架构演进**：
+```
+旧模式（断裂）：LLM 心算 → SympyExecutor 事后验证 → 发现错误 → 重来
+新模式（闭环）：LLM 推理 → 调用 sympy_calculate → 看到精确结果 → 继续推理
+```
+
+**预计算注入模式**（解决格式冲突）：
+GRAVEC 的 R/G 步骤要求 JSON 格式输出，与 tool_call 响应冲突。
+解决方案：在 R/G 步骤前独立调用工具，将精确结果注入 prompt：
+1. 先让 LLM 用 sympy_calculate 工具做计算
+2. 收集 SymPy 的精确变量值（computed_values）
+3. 将精确值注入 R/G 步骤的 prompt 中
+4. R/G 步骤的 LLM 只做推理和格式化，不需要做计算
+
+### 关键修改
+
+1. **`executors/tools.py`** — 工具调用循环
+   - `SYMPY_TOOL_SCHEMA`：OpenAI function calling 格式的工具定义
+   - `SympyToolHandler`：处理 LLM 的 sympy_calculate 调用
+   - `llm_call_with_tools()`：带工具调用的 LLM 对话循环
+   - `computed_values`：收集 SymPy 计算的所有变量值
+
+2. **`executors/sympy_exec.py`** — 安全执行器增强
+   - `_is_safe_code()`：剥离 import 语句后再做安全检查
+   - `_strip_imports()`：自动剥离 `import`/`from` 语句
+   - `_last_execution`：记录最后一次执行结果，支持提取变量
+
+3. **`core_nhx.py`** — GRAVEC 主循环集成
+   - R 步骤：预计算注入（compute → inject → format）
+   - G 步骤：同样支持预计算注入
+   - `use_tools` 参数：控制是否启用 tool-calling
+
+4. **`specs/gsm8k_nhx.py`** — 分数解析修复
+   - `_safe_eval_fraction()`：安全求值分数表达式（如 `11/36`）
+   - `parse_workspace_update()`：先尝试分数求值，再回退数字匹配
+
+### FastMCP 标准化迁移
+
+**动机**：未来可能使用其他 LLM（GPT-4o、Claude 等），工具定义应与模型解耦。
+
+**方案**：用 FastMCP 框架将 SymPy 工具标准化为 MCP Server，
+通过 MCP 协议（进程内模式）调用，零网络开销。
+
+**新增文件**：
+- `executors/mcp_server.py` — FastMCP Server + MCPToolBridge
+
+**架构**：
+```
+LLM（任何模型）→ OpenAI Function Calling → MCPToolBridge
+    → MCP 协议（进程内）→ FastMCP Server → SympyExecutor
+```
+
+**两种使用模式**：
+1. 进程内模式（默认）：`Client(server)` 直接调用，零开销
+2. 独立服务模式：`mcp.run(transport="stdio")` 供 Claude Desktop 等外部客户端
+
+**MCPToolBridge 核心方法**：
+- `get_openai_tools()` / `get_openai_tools_sync()`：从 MCP Server 获取 OpenAI 格式 schema
+- `call_tool()` / `call_tool_sync()`：通过 MCP 协议调用工具
+- `executor` 属性：访问底层 SympyExecutor（提取 computed_values）
+
+**tools.py 改造**：
+- `SympyToolHandler` 底层改用 `MCPToolBridge`
+- `get_sympy_tool_schema()` 从 MCP Server 自动获取 schema
+- `llm_call_with_tools()` 默认从 MCP 获取 tools
+- 完全向后兼容，API 不变
+
+### 测试结果
+
+**8 题验证（含 4 道之前失败的分数题）**：
+
+| seq | 题目 | 旧结果 | 新结果 | 状态 |
+|-----|------|--------|--------|------|
+| 55 | 11/36 | FAIL (36.0) | OK (0.306) | 修复 |
+| 62 | 1/3 | FAIL (3.0) | OK (0.333) | 修复 |
+| 79 | 1/4 | FAIL (4.0) | OK (0.25) | 修复 |
+| 46 | 10/11 | FAIL (11.0) | OK (0.909) | 修复 |
+| 3 | 22 | OK | OK | 保持 |
+| 15 | 3 | OK | OK | 保持 |
+| 27 | 10 | OK | OK | 保持 |
+| 88 | 6 | OK | OK | 保持 |
+
+**准确率：8/8 = 100%**（旧版 5/8 = 62.5%）
+
+**20 题快速基准（Tool-Calling ON）**：
+- 准确率：18/20 = 90.0%
+- 平均耗时：43.4s/题
+- L1: 8/9 (89%), L2: 10/11 (91%)
+
+**FastMCP 迁移后验证**：8/8 = 100%，完全兼容
+
+### 技术决策
+
+| 决策 | 选择 | 理由 |
+|------|------|------|
+| 工具调用协议 | OpenAI Function Calling | 所有 LLM 兼容，LiteLLM 统一接口 |
+| 工具标准化 | FastMCP (MCP) | 工具与模型解耦，换模型不改工具层 |
+| 调用模式 | 进程内 Client(server) | 零网络开销，性能等同直接调用 |
+| 分数解析 | _safe_eval_fraction() | 解决 \boxed{11/36} 被拆为 11 和 36 的问题 |
+| import 处理 | 自动剥离 | LLM 经常忽略"不要用 import"指令 |
+
+### 新增/修改文件
+- `src/reason_from_future/executors/mcp_server.py` — **新增** FastMCP Server + MCPToolBridge
+- `src/reason_from_future/executors/tools.py` — **重写** 使用 MCPToolBridge
+- `src/reason_from_future/executors/sympy_exec.py` — **修改** 自动剥离 import
+- `src/reason_from_future/core_nhx.py` — **修改** 预计算注入模式
+- `src/reason_from_future/specs/gsm8k_nhx.py` — **修改** 分数解析
+- `tests/test_tool_calling_multi.py` — 8 题验证脚本
+- `tests/benchmark_math500_100.py` — 添加 --use-tools 参数
+
+---
+
+## 2026-06-11: 社区级安全升级 — AST 安全检查 + 结构化错误码
+
+### 背景
+原 SympyExecutor 使用字符串黑名单做安全检查（如 `"open(" in code`），
+存在以下问题：
+1. 可通过字符串拼接绕过（如 `getattr(__builtins__, 'op'+'en')`）
+2. 无语法级验证，无法检测 AST 层面的危险操作
+3. 错误信息是原始异常文本，LLM 无法自动重试
+
+### 社区方案调研
+
+克隆并分析了三个社区 SymPy MCP 服务器：
+
+| 项目 | Stars | 工具粒度 | 安全模型 | 错误处理 |
+|------|-------|---------|---------|---------|
+| sdiehl/sympy-mcp | 57 | 30+ 细粒度 | 基础 | 基础 |
+| 611711Dark/sympy-calculator-mcp | - | 单工具 | 基础 | 基础 |
+| **Eis4TY/sym-mcp** | PyPI | 单工具 | **AST + OS资源限制** | **结构化错误码** |
+
+### 集成方案
+
+从 Eis4TY/sym-mcp (MIT License) 提取两个核心模块：
+
+1. **`security/ast_guard.py`** — AST 语法树级安全检查
+   - 白名单语法节点（50+ 种允许的 AST 节点）
+   - 禁止危险调用（eval/exec/open/compile/getattr 等）
+   - 禁止危险模块访问（os/sys/subprocess 等）
+   - 禁止双下划线标识符（`__class__` 等）
+   - 智能语法错误诊断（括号不匹配、缺少运算符等）
+   - 精确到行号的错误报告
+
+2. **`security/error_parser.py`** — 结构化错误码 + 修复提示
+   - 6 种标准错误码：E_AST_BLOCK / E_SYNTAX / E_TIMEOUT / E_MEMORY / E_RUNTIME / E_INTERNAL
+   - 每种错误码附带修复提示，供 LLM 自动重试
+   - 运行时错误智能诊断（NameError/TypeError/ZeroDivisionError 等）
+   - 精确到行号的错误定位
+
+### 改造内容
+
+**SympyExecutor v2 安全流程**：
+```
+旧: 字符串黑名单 → 剥离 import → exec → 原始异常
+新: AST 安全检查 → 剥离 import → linecache注册 → exec → 结构化错误码
+```
+
+**ExecutionResult 新增字段**：
+- `error_code`: 结构化错误码（E_AST_BLOCK / E_SYNTAX / ...）
+- `error_hint`: 修复提示（供 LLM 自动重试参考）
+
+**MCP 工具输出增强**：
+```
+旧: 计算错误: ZeroDivisionError: division by zero
+新: 计算错误: ZeroDivisionError: division by zero 源码: result = 1/0 可能原因: 出现除以零；请检查分母或极限点附近的表达式。
+    错误码: E_RUNTIME
+    修复提示: 运行时错误。请根据行号检查变量类型、零除、未定义变量等问题后重试。
+```
+
+### 安全性对比
+
+| 攻击向量 | 旧版（字符串黑名单） | 新版（AST 检查） |
+|---------|-------------------|----------------|
+| `open("/etc/passwd")` | 拦截 | 拦截 + 精确行号 |
+| `__import__("os")` | 可能漏过 | 拦截（双下划线） |
+| `getattr(obj, "system")` | 可能漏过 | 拦截（禁止 getattr） |
+| `os.system("rm -rf /")` | 拦截 | 拦截 + 精确行号 |
+| AST 级别注入 | 无法检测 | 白名单节点检测 |
+| 未知语法节点 | 无法检测 | 自动拒绝 |
+
+### 新增文件
+- `src/reason_from_future/executors/security/__init__.py` — 安全子包
+- `src/reason_from_future/executors/security/ast_guard.py` — AST 安全检查器（源自 Eis4TY/sym-mcp）
+- `src/reason_from_future/executors/security/error_parser.py` — 结构化错误解析器（源自 Eis4TY/sym-mcp）
+
+### 修改文件
+- `src/reason_from_future/executors/sympy_exec.py` — 用 AST guard 替换字符串黑名单，用结构化错误码替换原始异常
+- `src/reason_from_future/executors/base.py` — ExecutionResult 新增 error_code/error_hint 字段
+- `src/reason_from_future/executors/mcp_server.py` — 错误输出增加错误码和修复提示

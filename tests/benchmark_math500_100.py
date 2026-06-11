@@ -20,7 +20,7 @@ from reason_from_future.core_nhx import reason_from_future_nhx
 from reason_from_future.specs.math500_nhx import MATHNiHaixiaSpec
 
 
-def run_single(problem_data: dict, verbose: bool = False, timeout: int = 180) -> dict:
+def run_single(problem_data: dict, verbose: bool = False, timeout: int = 180, use_tools: bool = False) -> dict:
     """运行单题 GRAVEC v2。"""
     import threading
 
@@ -37,6 +37,7 @@ def run_single(problem_data: dict, verbose: bool = False, timeout: int = 180) ->
                 verbose=verbose,
                 require_gold=False,
                 min_iters=2,
+                use_tools=use_tools,
             )
             result_holder["answer"] = answer
         except Exception as e:
@@ -107,15 +108,26 @@ def run_single(problem_data: dict, verbose: bool = False, timeout: int = 180) ->
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--use-tools", action="store_true", help="启用 SymPy tool-calling 预计算")
+    parser.add_argument("--limit", type=int, default=0, help="限制测试题数（0=全部）")
+    args = parser.parse_args()
+
     data_path = os.path.join(os.path.dirname(__file__), "..", "math500_100_numeric.jsonl")
     with open(data_path) as f:
         selected = [json.loads(line) for line in f]
 
+    if args.limit > 0:
+        selected = selected[:args.limit]
+
+    tools_label = " + SymPy Tool-Calling" if args.use_tools else ""
     print(f"\n{'='*70}")
-    print(f"GRAVEC v2 + Agnes 2.0 Flash — MATH-500 100题基准测试")
+    print(f"GRAVEC v2 + Agnes 2.0 Flash{tools_label} — MATH-500 基准测试")
     print(f"模型: openai/agnes-2.0-flash")
-    print(f"题目: {len(selected)} 道 (分层抽样: L1:9 L2:18 L3:21 L4:26 L5:26)")
+    print(f"题目: {len(selected)} 道")
     print(f"引擎: reason_from_future_nhx (GRAVEC 六步曲)")
+    print(f"Tool-Calling: {'ON' if args.use_tools else 'OFF'}")
     print(f"最大迭代: 10 | 最少迭代: 2 | 超时: 180s/题")
     print(f"容差: 1e-3 相对误差")
     print(f"{'='*70}\n")
@@ -131,7 +143,7 @@ def main():
             end=" ",
             flush=True,
         )
-        result = run_single(problem_data, verbose=False)
+        result = run_single(problem_data, verbose=False, use_tools=args.use_tools)
         results.append(result)
 
         status = "OK" if result["correct"] else "FAIL"
