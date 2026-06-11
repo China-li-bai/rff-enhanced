@@ -35,6 +35,7 @@ class SympyExecutor:
 
     def __init__(self, timeout: int = 10):
         self._timeout = timeout
+        self._last_execution: ExecutionResult | None = None
         self._init_safe_globals()
 
     def _init_safe_globals(self) -> None:
@@ -110,12 +111,17 @@ class SympyExecutor:
 
         # 安全检查
         if not self._is_safe_code(code):
-            return ExecutionResult(
+            result = ExecutionResult(
                 success=False,
                 error="代码包含不安全操作（import/open/exec/eval/compile）",
                 code=code,
                 elapsed_s=time.time() - start,
             )
+            self._last_execution = result
+            return result
+
+        # 自动剥离 import 语句（LLM 经常忽略"不要用 import"的指令）
+        code = self._strip_imports(code)
 
         # 执行
         try:
@@ -134,7 +140,7 @@ class SympyExecutor:
             result = self._sympy_to_python(result)
 
             elapsed = time.time() - start
-            return ExecutionResult(
+            result = ExecutionResult(
                 success=True,
                 result=result,
                 result_type=type(result).__name__,
@@ -146,30 +152,57 @@ class SympyExecutor:
                     if not k.startswith("_") and not callable(v) and k not in self._SAFE_GLOBALS
                 },
             )
+            self._last_execution = result
+            return result
         except Exception as e:
             elapsed = time.time() - start
-            return ExecutionResult(
+            result = ExecutionResult(
                 success=False,
                 error=f"{type(e).__name__}: {e}",
                 code=code,
                 elapsed_s=elapsed,
             )
+            self._last_execution = result
+            return result
 
     @staticmethod
     def _is_safe_code(code: str) -> bool:
-        """检查代码是否安全。"""
+        """检查代码是否安全（排除 import 语句后检查）。"""
         forbidden = [
-            "import ", "from ", "__import__",
+            "__import__",
             "open(", "exec(", "eval(", "compile(",
             "os.", "sys.", "subprocess.", "shutil.",
             "globals()", "locals()", "vars(",
             "getattr(", "setattr(", "delattr(",
         ]
-        code_lower = code.lower()
+        # 先剥离 import/from 语句（LLM 经常忽略"不要用 import"的指令）
+        lines = code.split("\n")
+        stripped_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("import ") or stripped.startswith("from "):
+                continue  # 跳过 import 行
+            stripped_lines.append(line)
+        stripped_code = "\n".join(stripped_lines)
+
+        # 在剥离 import 后的代码上做安全检查
+        code_lower = stripped_code.lower()
         for f in forbidden:
             if f.lower() in code_lower:
                 return False
         return True
+
+    @staticmethod
+    def _strip_imports(code: str) -> str:
+        """剥离代码中的 import/from 语句。"""
+        lines = code.split("\n")
+        result = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("import ") or stripped.startswith("from "):
+                continue
+            result.append(line)
+        return "\n".join(result)
 
     @staticmethod
     def _sympy_to_python(value: Any) -> Any:

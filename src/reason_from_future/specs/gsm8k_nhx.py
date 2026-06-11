@@ -35,6 +35,26 @@ _JSON_OBJECT_RE = re.compile(r"\{[\s\S]*\}")
 _NUMBER_RE = re.compile(r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?")
 _VAR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+
+def _safe_eval_fraction(text: str) -> float | None:
+    """安全地求值分数表达式（如 '11/36', '-3/4', '1/2'）。
+
+    只支持 数字/数字 格式，不支持其他运算符。
+    """
+    text = text.strip().replace(",", "")
+    # 匹配可选负号 + 数字 + / + 数字
+    m = re.match(r"^(-?\d+(?:\.\d+)?)\s*/\s*(-?\d+(?:\.\d+)?)$", text)
+    if m:
+        num, den = float(m.group(1)), float(m.group(2))
+        if den != 0:
+            return num / den
+    # 也支持纯数字
+    try:
+        val = float(text)
+        return val
+    except ValueError:
+        return None
+
 _ALLOWED_BIN_OPS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
@@ -373,7 +393,17 @@ class GSM8KNiHaixiaSpec(NiHaixiaSpec):
         if not data:
             boxed_matches = re.findall(r"\\boxed\{([^{}]+)\}", raw_text)
             if boxed_matches:
-                numbers = _NUMBER_RE.findall(boxed_matches[-1])
+                boxed_content = boxed_matches[-1].strip()
+                # 先尝试作为分数表达式求值（如 11/36, -3/4）
+                try:
+                    # 安全地求值分数表达式
+                    fraction_val = _safe_eval_fraction(boxed_content)
+                    if fraction_val is not None:
+                        return Workspace({"final_answer": fraction_val})
+                except Exception:
+                    pass
+                # 回退到数字匹配
+                numbers = _NUMBER_RE.findall(boxed_content)
                 if numbers:
                     return Workspace({"final_answer": float(numbers[-1].replace(",", ""))})
             parsed = self._base.parse_workspace_update(raw_text, state)

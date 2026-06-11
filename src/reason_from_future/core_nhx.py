@@ -48,6 +48,7 @@
 """
 from __future__ import annotations
 
+import json
 from abc import abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Set
@@ -573,17 +574,51 @@ def reason_from_future_nhx(
             )
 
             if _tool_handler is not None:
-                # Tool-calling 路径：LLM 可以调用 sympy 精确计算
-                direct_result = llm_call_with_tools(
-                    messages=[{"role": "user", "content": direct_prompt}],
+                # Tool-calling 预计算模式：
+                # 1. 先让 LLM 用 sympy_calculate 工具做计算
+                # 2. 把 sympy 精确值注入到 G 步骤的 prompt 中
+                calc_prompt = (
+                    f"You are solving a math problem.\n"
+                    f"Problem: {problem}\n\n"
+                    f"Use sympy_calculate to compute the final answer. "
+                    f"Then state the result clearly."
+                )
+                calc_result = llm_call_with_tools(
+                    messages=[{"role": "user", "content": calc_prompt}],
                     tool_handler=_tool_handler,
                     model=model,
                     max_tool_rounds=3,
                     verbose=verbose,
                 )
-                direct_raw = direct_result["content"]
-                if verbose and direct_result["tool_calls_count"] > 0:
-                    print(f"[G-以果] Tool-calling: {direct_result['tool_calls_count']} 次工具调用")
+                calc_content = calc_result["content"]
+                computed = calc_result.get("computed_values", {})
+                if verbose and calc_result["tool_calls_count"] > 0:
+                    print(f"[G-预计算] Tool-calling: {calc_result['tool_calls_count']} 次工具调用")
+                    if computed:
+                        print(f"[G-预计算] sympy精确值: {computed}")
+
+                # 优先使用 sympy 精确值
+                if computed:
+                    exact_values = []
+                    for k, v in computed.items():
+                        if k == "__result__":
+                            exact_values.append(f"result = {v}")
+                        else:
+                            exact_values.append(f"{k} = {v}")
+                    direct_prompt += (
+                        f"\n\n[SymPy Exact Computation Results]:\n"
+                        + "\n".join(f"  - {v}" for v in exact_values)
+                        + f"\n\nUse these exact values in your answer. "
+                        f"Do NOT recompute or approximate."
+                    )
+                else:
+                    direct_prompt += (
+                        f"\n\n[SymPy Computation Result]: {calc_content}\n"
+                        f"Use this computation result in your answer. "
+                        f"Do NOT recompute — use the exact value from the computation above."
+                    )
+
+                direct_raw = llm_call(direct_prompt, model=model, verbose=verbose)
             else:
                 direct_raw = llm_call(direct_prompt, model=model, verbose=verbose)
 
@@ -633,17 +668,57 @@ def reason_from_future_nhx(
         )
 
         if _tool_handler is not None:
-            # Tool-calling 路径：LLM 可以调用 sympy 精确计算
-            forward_result = llm_call_with_tools(
-                messages=[{"role": "user", "content": r_prompt}],
+            # Tool-calling 预计算模式：
+            # 1. 先让 LLM 用 sympy_calculate 工具做计算
+            # 2. 把 sympy 的精确计算结果注入到 R 步骤的 prompt 中
+            # 3. R 步骤的 LLM 只做推理和格式化，不需要做计算
+            calc_prompt = (
+                f"You are solving a math problem step-by-step.\n"
+                f"Problem: {problem}\n\n"
+                f"Current goal: compute the variable '{target_step}'.\n"
+                f"Known variables: {json.dumps(state)}\n\n"
+                f"Use sympy_calculate to compute the value of '{target_step}'. "
+                f"Then state the result clearly."
+            )
+            calc_result = llm_call_with_tools(
+                messages=[{"role": "user", "content": calc_prompt}],
                 tool_handler=_tool_handler,
                 model=model,
                 max_tool_rounds=3,
                 verbose=verbose,
             )
-            forward_raw = forward_result["content"]
-            if verbose and forward_result["tool_calls_count"] > 0:
-                print(f"[R-推理] Tool-calling: {forward_result['tool_calls_count']} 次工具调用")
+            calc_content = calc_result["content"]
+            computed = calc_result.get("computed_values", {})
+            if verbose and calc_result["tool_calls_count"] > 0:
+                print(f"[R-预计算] Tool-calling: {calc_result['tool_calls_count']} 次工具调用")
+                if computed:
+                    print(f"[R-预计算] sympy精确值: {computed}")
+
+            # 把预计算结果注入到 R 步骤 prompt 中
+            # 优先使用 sympy 的精确计算值（computed_values），而非 LLM 文本描述
+            if computed:
+                # 格式化精确值列表
+                exact_values = []
+                for k, v in computed.items():
+                    if k == "__result__":
+                        exact_values.append(f"result = {v}")
+                    else:
+                        exact_values.append(f"{k} = {v}")
+                r_prompt += (
+                    f"\n\n[SymPy Exact Computation Results]:\n"
+                    + "\n".join(f"  - {v}" for v in exact_values)
+                    + f"\n\nIMPORTANT: Use these exact values from SymPy in your JSON output. "
+                    f"Do NOT recompute or approximate. Use the exact numeric values above."
+                )
+            else:
+                # 没有精确值时，使用 LLM 的文本描述
+                r_prompt += (
+                    f"\n\n[SymPy Computation Result]: {calc_content}\n"
+                    f"Use this computation result to fill in the JSON output. "
+                    f"Do NOT recompute — use the exact value from the computation above."
+                )
+
+            forward_raw = llm_call(r_prompt, model=model, verbose=verbose)
         else:
             forward_raw = llm_call(r_prompt, model=model, verbose=verbose)
 

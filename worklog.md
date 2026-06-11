@@ -180,3 +180,120 @@ L5（最高难度）准确率仍达 75%，证明 GRAVEC 框架对复杂多步推
 - `math500_36_numeric.jsonl` — 选定的 36 题
 - `math500_raw.jsonl` — 500 题全集（HF mirror 下载）
 - `math500_gravec_results.json` — 详细测试结果
+
+---
+
+## 2026-06-10: MATH-500 100题基准测试 + 架构修复
+
+### 背景
+将 MATH-500 测试从 36 题扩展到 100 题，获得更可靠的准确率估计。
+同时修复了多个阻碍运行的 bug。
+
+### Bug 修复
+
+1. **SympyExecutor `_SAFE_GLOBALS` 为空**
+   - 原因：`from sympy import inverse, mod` 在 sympy 1.14 中不存在，
+     导致整个 import 块失败被 `except ImportError` 吞掉
+   - 修复：改为逐个 `getattr(sympy, name)` 导入，跳过不存在的函数
+
+2. **ProblemClassifier `re.PatternError`**
+   - 原因：`_SUBJECT_PATTERNS` 中的正则表达式有未闭合的括号
+   - 修复：重写为 `_SUBJECT_RULES` 列表，每个学科一条独立正则，
+     并在 `_classify_subject` 中添加 `try/except re.error` 保护
+
+3. **llm_call 无超时**
+   - 原因：`litellm.completion()` 默认无超时，API 卡住会永远等待
+   - 修复：添加 `timeout=120` 参数
+
+4. **benchmark 超时机制**
+   - `signal.SIGALRM` 在 litellm 内部线程中不起作用
+   - 改用 `threading.Thread(daemon=True) + t.join(timeout=180)` 实现
+
+### 数据集
+
+**100 题分层抽样**（`scripts/select_100_math500.py`）：
+- L1: 9, L2: 18, L3: 21, L4: 26, L5: 26 = **100 道**
+- 学科分布：Algebra 32, Prealgebra 18, Intermediate Algebra 16,
+  Counting & Probability 13, Geometry 9, Number Theory 7, Precalculus 5
+
+### 测试结果
+
+| 指标 | 结果 |
+|------|------|
+| **总准确率** | **89/100 = 89.0%** |
+| 总耗时 | 2422.3s |
+| 平均耗时 | 24.2s/题 |
+
+**按难度分布**：
+
+| 等级 | 正确率 | 平均耗时 |
+|------|--------|----------|
+| L1 | 8/9 = 89%  | 17.6s/题 |
+| L2 | 17/18 = 94% | 20.7s/题 |
+| L3 | 19/21 = 90% | 17.5s/题 |
+| L4 | 22/26 = 85% | 25.4s/题 |
+| L5 | 23/26 = 88% | 33.2s/题 |
+
+**按学科分布**：
+
+| 学科 | 正确率 |
+|------|--------|
+| Algebra | 31/32 (97%) |
+| Counting & Probability | 10/13 (77%) |
+| Geometry | 8/9 (89%) |
+| Intermediate Algebra | 13/16 (81%) |
+| Number Theory | 7/7 (100%) |
+| Prealgebra | 15/18 (83%) |
+| Precalculus | 5/5 (100%) |
+
+**错误题目 (11 道)**：
+
+| seq | Lv | 学科 | got | gold | 错误类型 |
+|-----|----|----|-----|------|----------|
+| 2  | L1 | Geometry | 62.0 | 28 | 几何推理错误 |
+| 14 | L2 | Int. Algebra | 7.0 | 357 | 多值答案解析错误 |
+| 31 | L3 | Algebra | 1.0 | 4.667 | 分数计算错误 |
+| 46 | L3 | Int. Algebra | 11.0 | 0.909 | 分子分母反转 |
+| 54 | L4 | Prealgebra | 154.0 | 116 | 计算错误 |
+| 55 | L4 | C&P | 36.0 | 0.306 | 分子分母反转 |
+| 58 | L4 | Prealgebra | None | 12 | 超时 (180s) |
+| 62 | L4 | C&P | 3.0 | 0.333 | 分子分母反转 |
+| 79 | L5 | Int. Algebra | 4.0 | 0.25 | 分子分母反转 |
+| 87 | L5 | Prealgebra | 23.0 | 22 | 差一错误 |
+| 94 | L5 | C&P | 8.0 | 19 | 计算错误 |
+
+### 错误模式分析
+
+1. **分数反转**（4/11 错误 = 36%）：模型把 \frac{a}{b} 算成 b/a
+   - seq 46: got=11, gold=10/11=0.909
+   - seq 55: got=36, gold=11/36=0.306
+   - seq 62: got=3, gold=1/3=0.333
+   - seq 79: got=4, gold=1/4=0.25
+   → **改进方向**：SympyExecutor 强制用 Rational(a,b) 而非 a/b
+
+2. **几何推理**（1/11）：Asymptote 代码导致 LLM 生成超长推理
+   → **改进方向**：预处理时剥离 Asymptote 代码块
+
+3. **超时**（1/11）：L4 Prealgebra 题耗时 >180s
+   → **改进方向**：Early Stop 机制优化
+
+### 36题 vs 100题对比
+
+| 规模 | 准确率 | 平均耗时 | 样本代表性 |
+|------|--------|----------|-----------|
+| 36题 | 86.1% | 29.7s/题 | 每级 5-8 道，统计波动大 |
+| 100题 | 89.0% | 24.2s/题 | 每级 9-26 道，更可靠 |
+
+**结论**：100 题测试验证了 GRAVEC v2 在 MATH-500 上的稳健表现。
+89.0% 准确率与 36 题的 86.1% 一致（在统计误差范围内），
+且 L5（最高难度）准确率从 75% 提升到 88%，说明更多样本下
+GRAVEC 对复杂题目的处理能力被低估了。
+
+### 新增/修改文件
+- `src/reason_from_future/executors/sympy_exec.py` — 修复 sympy 导入
+- `src/reason_from_future/router/classifier.py` — 修复正则 + 重写
+- `src/reason_from_future/llm.py` — 添加 120s 超时
+- `scripts/select_100_math500.py` — 100 题分层抽样脚本
+- `tests/benchmark_math500_100.py` — 100 题基准测试脚本
+- `math500_100_numeric.jsonl` — 选定的 100 题
+- `math500_100_gravec_results.json` — 详细测试结果
