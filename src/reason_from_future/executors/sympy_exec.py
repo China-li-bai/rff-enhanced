@@ -223,7 +223,10 @@ class SympyExecutor:
             elif isinstance(value, (list, tuple)):
                 return [SympyExecutor._sympy_to_python(v) for v in value]
             elif isinstance(value, dict):
-                return {k: SympyExecutor._sympy_to_python(v) for k, v in value.items()}
+                return {
+                    SympyExecutor._sympy_to_python(k): SympyExecutor._sympy_to_python(v)
+                    for k, v in value.items()
+                }
             elif isinstance(value, sympy.Basic):
                 try:
                     f = float(value)
