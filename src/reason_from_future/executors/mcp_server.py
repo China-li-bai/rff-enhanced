@@ -83,7 +83,7 @@ def sympy_calculate(code: str, purpose: str = "") -> str:
             parts.append(f"类型: {exec_result.result_type}")
         if exec_result.variables:
             user_vars = {
-                k: v for k, v in exec_result.variables.items()
+                str(k): v for k, v in exec_result.variables.items()
                 if k != "result"
             }
             if user_vars:
